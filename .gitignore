@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+
+# ESP-IDF managed components and dependency lock artifacts
+managed_components/
+.idf_component_manager/
+
+# Common ESP-IDF local config backup
+sdkconfig.old
+
+# Editor and OS files
+.vscode/
+.DS_Store
+Thumbs.db
