@@ -1,0 +1,2 @@
+source C:/Users/jakep/Documents/ESP32/robot_gateway/build/bootloader/gdbinit/symbols
+source C:/Users/jakep/Documents/ESP32/robot_gateway/build/bootloader/gdbinit/connect
