@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,8 +41,18 @@
 
 static const char *TAG = "ROBOT_GW";
 
+typedef struct {
+    bool is_stream;
+    bool has_end;
+    uint32_t seq;
+    const char *payload;
+} stream_frame_t;
+
 // Simple mutex around LoRa send
 static SemaphoreHandle_t lora_tx_lock;
+
+static bool rx_seq_init = false;
+static uint32_t rx_seq_expected = 0;
 
 // ---------------- Helpers ----------------
 
@@ -62,6 +73,44 @@ static char* trim_inplace(char *s) {
     }
 
     return s;
+}
+
+static stream_frame_t parse_stream_frame(char *text)
+{
+    stream_frame_t out = {
+        .is_stream = false,
+        .has_end = true,
+        .seq = 0,
+        .payload = text
+    };
+
+    if (!text || strncmp(text, "S:", 2) != 0) {
+        return out;
+    }
+
+    char *p = text + 2;
+    char *endptr = NULL;
+    unsigned long seq = strtoul(p, &endptr, 10);
+    if (endptr == p || !endptr || *endptr != ':') {
+        return out;
+    }
+
+    out.is_stream = true;
+    out.seq = (uint32_t)seq;
+
+    char *payload = endptr + 1;
+
+    // New format: S:<seq>:<M|E>:<payload>
+    if ((payload[0] == 'M' || payload[0] == 'E') && payload[1] == ':') {
+        out.has_end = (payload[0] == 'E');
+        out.payload = payload + 2;
+    } else {
+        // Backward compatibility: S:<seq>:<payload> treated as end-of-line chunk
+        out.has_end = true;
+        out.payload = payload;
+    }
+
+    return out;
 }
 
 static void validate_pin_map(void) {
@@ -161,8 +210,27 @@ static void lora_rx_task(void *arg) {
             rx_copy[sizeof(rx_copy) - 1] = '\0';
             char *cmd = trim_inplace(rx_copy);
 
+            stream_frame_t frame = parse_stream_frame(cmd);
+            const char *uart_payload = frame.payload ? frame.payload : "";
+
+            if (frame.is_stream) {
+                if (!rx_seq_init) {
+                    rx_seq_expected = frame.seq + 1;
+                    rx_seq_init = true;
+                } else {
+                    if (frame.seq != rx_seq_expected) {
+                        ESP_LOGW(TAG, "LoRa stream seq gap: got=%lu expected=%lu",
+                                 (unsigned long)frame.seq,
+                                 (unsigned long)rx_seq_expected);
+                    }
+                    rx_seq_expected = frame.seq + 1;
+                }
+            }
+
             // Pass through any line payload (normalize only CRLF)
-            int w = snprintf(line, sizeof(line), "%s\r\n", cmd);
+            int w = frame.has_end
+                ? snprintf(line, sizeof(line), "%s\r\n", uart_payload)
+                : snprintf(line, sizeof(line), "%s", uart_payload);
             if (w > 0) {
                 uart_write_bytes(GW_UART, line, w);
                 ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
@@ -200,7 +268,7 @@ static void uart_rx_task(void *arg) {
                 if (c == '\n') {
                     line[line_len] = '\0';
                     if (line_len > 0) {
-                        int w = snprintf(framed, sizeof(framed), "S:%lu:%.*s",
+                        int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s",
                                          (unsigned long)stream_seq++, line_len, line);
                         if (w > 0) {
                             ESP_LOGI(TAG, "UART RX chunk seq=%lu (%d bytes)",
@@ -215,7 +283,7 @@ static void uart_rx_task(void *arg) {
                     } else {
                         // Stream is longer than one LoRa packet: send current chunk and continue.
                         line[line_len] = '\0';
-                        int w = snprintf(framed, sizeof(framed), "S:%lu:%.*s",
+                        int w = snprintf(framed, sizeof(framed), "S:%lu:M:%.*s",
                                          (unsigned long)stream_seq++, line_len, line);
                         if (w > 0) {
                             ESP_LOGI(TAG, "UART stream chunk seq=%lu (%d bytes)",
