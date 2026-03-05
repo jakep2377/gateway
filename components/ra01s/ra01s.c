@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include <driver/spi_master.h>
 #include <driver/gpio.h>
@@ -23,6 +24,7 @@
 #endif
 
 static spi_device_handle_t SpiHandle;
+static SemaphoreHandle_t SpiMutex;
 
 // Global Stuff
 static uint8_t PacketParams[6];
@@ -72,6 +74,8 @@ void LoRaInit(void)
 	
 	txActive = false;
 	debugPrint = false;
+	SpiMutex = xSemaphoreCreateMutex();
+	assert(SpiMutex != NULL);
 
 	gpio_reset_pin(SX126x_SPI_SELECT);
 	gpio_set_direction(SX126x_SPI_SELECT, GPIO_MODE_OUTPUT);
@@ -125,11 +129,13 @@ void spi_write_byte(uint8_t* Dataout, size_t DataLength )
 	spi_transaction_t SPITransaction;
 
 	if ( DataLength > 0 ) {
+		xSemaphoreTake(SpiMutex, portMAX_DELAY);
 		memset( &SPITransaction, 0, sizeof( spi_transaction_t ) );
 		SPITransaction.length = DataLength * 8;
 		SPITransaction.tx_buffer = Dataout;
 		SPITransaction.rx_buffer = NULL;
 		spi_device_transmit( SpiHandle, &SPITransaction );
+		xSemaphoreGive(SpiMutex);
 	}
 
 	return;
@@ -140,11 +146,13 @@ void spi_read_byte(uint8_t* Datain, uint8_t* Dataout, size_t DataLength )
 	spi_transaction_t SPITransaction;
 
 	if ( DataLength > 0 ) {
+		xSemaphoreTake(SpiMutex, portMAX_DELAY);
 		memset( &SPITransaction, 0, sizeof( spi_transaction_t ) );
 		SPITransaction.length = DataLength * 8;
 		SPITransaction.tx_buffer = Dataout;
 		SPITransaction.rx_buffer = Datain;
 		spi_device_transmit( SpiHandle, &SPITransaction );
+		xSemaphoreGive(SpiMutex);
 	}
 
 	return;
