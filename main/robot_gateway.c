@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -182,8 +183,10 @@ static void uart_rx_task(void *arg) {
     (void)arg;
     uint8_t buf[UART_RX_BUF_SIZE];
     char line[UART_LINE_MAX];
+    char framed[LORA_MAX_PAYLOAD + 1];
     int line_len = 0;
-    const int chunk_max = LORA_MAX_PAYLOAD;
+    uint32_t stream_seq = 0;
+    const int chunk_max = LORA_MAX_PAYLOAD - 16; // reserve for "S:<seq>:"
 
     while (1) {
         int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
@@ -197,8 +200,13 @@ static void uart_rx_task(void *arg) {
                 if (c == '\n') {
                     line[line_len] = '\0';
                     if (line_len > 0) {
-                        ESP_LOGI(TAG, "UART RX <- STM32: %s", line);
-                        lora_send_text(line);
+                        int w = snprintf(framed, sizeof(framed), "S:%lu:%.*s",
+                                         (unsigned long)stream_seq++, line_len, line);
+                        if (w > 0) {
+                            ESP_LOGI(TAG, "UART RX chunk seq=%lu (%d bytes)",
+                                     (unsigned long)(stream_seq - 1), line_len);
+                            lora_send_text(framed);
+                        }
                     }
                     line_len = 0;
                 } else {
@@ -207,8 +215,13 @@ static void uart_rx_task(void *arg) {
                     } else {
                         // Stream is longer than one LoRa packet: send current chunk and continue.
                         line[line_len] = '\0';
-                        ESP_LOGI(TAG, "UART stream chunk (%d bytes)", line_len);
-                        lora_send_text(line);
+                        int w = snprintf(framed, sizeof(framed), "S:%lu:%.*s",
+                                         (unsigned long)stream_seq++, line_len, line);
+                        if (w > 0) {
+                            ESP_LOGI(TAG, "UART stream chunk seq=%lu (%d bytes)",
+                                     (unsigned long)(stream_seq - 1), line_len);
+                            lora_send_text(framed);
+                        }
 
                         line_len = 0;
                         line[line_len++] = c;
