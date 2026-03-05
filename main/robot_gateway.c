@@ -53,6 +53,8 @@ static SemaphoreHandle_t lora_tx_lock;
 
 static bool rx_seq_init = false;
 static uint32_t rx_seq_expected = 0;
+static char rx_stream_buf[UART_LINE_MAX];
+static int rx_stream_len = 0;
 
 // ---------------- Helpers ----------------
 
@@ -236,25 +238,51 @@ static void lora_rx_task(void *arg) {
 
             if (frame.is_stream) {
                 if (!rx_seq_init) {
-                    rx_seq_expected = frame.seq + 1;
+                    rx_seq_expected = frame.seq;
                     rx_seq_init = true;
                 } else {
                     if (frame.seq != rx_seq_expected) {
-                        ESP_LOGW(TAG, "LoRa stream seq gap: got=%lu expected=%lu",
-                                 (unsigned long)frame.seq,
-                                 (unsigned long)rx_seq_expected);
+                        rx_stream_len = 0;
+                        rx_seq_expected = frame.seq;
                     }
-                    rx_seq_expected = frame.seq + 1;
                 }
-            }
 
-            // Pass through any line payload (normalize only CRLF)
-            int w = frame.has_end
-                ? snprintf(line, sizeof(line), "%s\r\n", uart_payload)
-                : snprintf(line, sizeof(line), "%s", uart_payload);
-            if (w > 0) {
-                uart_write_bytes(GW_UART, line, w);
-                ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                size_t payload_len = strlen(uart_payload);
+                if (payload_len > 0 && uart_payload[payload_len - 1] == '\n') {
+                    payload_len--;
+                }
+
+                int remain = (int)sizeof(rx_stream_buf) - 1 - rx_stream_len;
+                if (remain > 0 && payload_len > 0) {
+                    size_t copy_len = payload_len > (size_t)remain ? (size_t)remain : payload_len;
+                    memcpy(&rx_stream_buf[rx_stream_len], uart_payload, copy_len);
+                    rx_stream_len += (int)copy_len;
+                    rx_stream_buf[rx_stream_len] = '\0';
+                }
+
+                rx_seq_expected = frame.seq + 1;
+
+                if (!frame.has_end) {
+                    char ack[80];
+                    snprintf(ack, sizeof(ack), "ACK:%.70s", (char*)rx);
+                    lora_send_text(ack);
+                    continue;
+                }
+
+                int w = snprintf(line, sizeof(line), "%s\r\n", rx_stream_buf);
+                if (w > 0) {
+                    uart_write_bytes(GW_UART, line, w);
+                    ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                }
+                rx_stream_len = 0;
+                rx_stream_buf[0] = '\0';
+            } else {
+                // Pass through legacy/non-stream payload as one line
+                int w = snprintf(line, sizeof(line), "%s\r\n", uart_payload);
+                if (w > 0) {
+                    uart_write_bytes(GW_UART, line, w);
+                    ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                }
             }
 
             // Send ACK back over LoRa so base station can confirm delivery
