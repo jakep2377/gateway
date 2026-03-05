@@ -275,7 +275,7 @@ static void uart_rx_task(void *arg) {
     char framed[LORA_MAX_PAYLOAD + 1];
     int line_len = 0;
     uint32_t stream_seq = 0;
-    const int chunk_max = LORA_MAX_PAYLOAD - 16; // reserve for "S:<seq>:"
+    const int chunk_max = LORA_MAX_PAYLOAD - 16; // reserve for "S:<seq>:<M|E>:" + "\n"
 
     while (1) {
         int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
@@ -289,7 +289,7 @@ static void uart_rx_task(void *arg) {
                 if (c == '\n') {
                     line[line_len] = '\0';
                     if (line_len > 0) {
-                        int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s",
+                        int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
                                          (unsigned long)stream_seq++, line_len, line);
                         if (w > 0) {
                             ESP_LOGI(TAG, "UART RX chunk seq=%lu (%d bytes)",
@@ -304,7 +304,7 @@ static void uart_rx_task(void *arg) {
                     } else {
                         // Stream is longer than one LoRa packet: send current chunk and continue.
                         line[line_len] = '\0';
-                        int w = snprintf(framed, sizeof(framed), "S:%lu:M:%.*s",
+                        int w = snprintf(framed, sizeof(framed), "S:%lu:M:%.*s\n",
                                          (unsigned long)stream_seq++, line_len, line);
                         if (w > 0) {
                             ESP_LOGI(TAG, "UART stream chunk seq=%lu (%d bytes)",
