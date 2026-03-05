@@ -183,6 +183,7 @@ static void uart_rx_task(void *arg) {
     uint8_t buf[UART_RX_BUF_SIZE];
     char line[UART_LINE_MAX];
     int line_len = 0;
+    const int chunk_max = LORA_MAX_PAYLOAD;
 
     while (1) {
         int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
@@ -190,7 +191,7 @@ static void uart_rx_task(void *arg) {
             for (int i = 0; i < r; i++) {
                 char c = (char)buf[i];
 
-                // Build line until newline
+                // Build stream/chunks; newline flushes the current chunk.
                 if (c == '\r') continue;
 
                 if (c == '\n') {
@@ -201,12 +202,16 @@ static void uart_rx_task(void *arg) {
                     }
                     line_len = 0;
                 } else {
-                    if (line_len < (UART_LINE_MAX - 1)) {
+                    if (line_len < chunk_max) {
                         line[line_len++] = c;
                     } else {
-                        // Overflow: reset current line to avoid stale partial packets
-                        ESP_LOGW(TAG, "UART line overflow (>=%d), dropping line", UART_LINE_MAX);
+                        // Stream is longer than one LoRa packet: send current chunk and continue.
+                        line[line_len] = '\0';
+                        ESP_LOGI(TAG, "UART stream chunk (%d bytes)", line_len);
+                        lora_send_text(line);
+
                         line_len = 0;
+                        line[line_len++] = c;
                     }
                 }
             }
