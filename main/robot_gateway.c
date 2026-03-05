@@ -75,6 +75,26 @@ static char* trim_inplace(char *s) {
     return s;
 }
 
+static void make_printable(const char *in, size_t in_len, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    if (!in || in_len == 0) {
+        out[0] = '\0';
+        return;
+    }
+
+    size_t j = 0;
+    for (size_t i = 0; i < in_len && j + 1 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c >= 32 && c <= 126) {
+            out[j++] = (char)c;
+        } else {
+            out[j++] = '.';
+        }
+    }
+    out[j] = '\0';
+}
+
 static stream_frame_t parse_stream_frame(char *text)
 {
     stream_frame_t out = {
@@ -193,6 +213,7 @@ static void lora_send_text(const char *text) {
 static void lora_rx_task(void *arg) {
     (void)arg;
     uint8_t rx[255];
+    char rx_log[255];
 
     while (1) {
         uint8_t n = LoRaReceive(rx, sizeof(rx));
@@ -200,8 +221,8 @@ static void lora_rx_task(void *arg) {
             // Ensure it's printable as a C string
             if (n >= sizeof(rx)) n = sizeof(rx) - 1;
             rx[n] = '\0';
-
-            ESP_LOGI(TAG, "LoRa RX (%d): %s", n, (char*)rx);
+            make_printable((const char *)rx, n, rx_log, sizeof(rx_log));
+            ESP_LOGI(TAG, "LoRa RX (%d): %s", n, rx_log);
 
             // Forward to STM32 as a line-based command
             char line[UART_LINE_MAX];
