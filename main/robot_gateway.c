@@ -101,31 +101,6 @@ static void make_printable(const char *in, size_t in_len, char *out, size_t out_
     out[j] = '\0';
 }
 
-static bool extract_json_cmd(const char *input, char *out, size_t out_size)
-{
-    if (!input || !out || out_size == 0) return false;
-
-    const char *key = "\"cmd\"";
-    const char *p = strstr(input, key);
-    if (!p) return false;
-
-    p += strlen(key);
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != ':') return false;
-    p++;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return false;
-    p++;
-
-    size_t n = 0;
-    while (*p && *p != '"' && n + 1 < out_size) {
-        out[n++] = *p++;
-    }
-    out[n] = '\0';
-
-    return n > 0 && *p == '"';
-}
-
 static stream_frame_t parse_stream_frame(char *text)
 {
     stream_frame_t out = {
@@ -248,7 +223,6 @@ static void lora_rx_task(void *arg) {
     (void)arg;
     uint8_t rx[255];
     char rx_log[255];
-    char uart_cmd[UART_LINE_MAX];
 
     while (1) {
         uint8_t n = LoRaReceive(rx, sizeof(rx));
@@ -303,9 +277,6 @@ static void lora_rx_task(void *arg) {
                 }
 
                 int w = snprintf(line, sizeof(line), "%s\r\n", rx_stream_buf);
-                if (extract_json_cmd(rx_stream_buf, uart_cmd, sizeof(uart_cmd))) {
-                    w = snprintf(line, sizeof(line), "%s\r\n", uart_cmd);
-                }
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
                     ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
@@ -315,9 +286,6 @@ static void lora_rx_task(void *arg) {
             } else {
                 // Pass through legacy/non-stream payload as one line
                 int w = snprintf(line, sizeof(line), "%s\r\n", uart_payload);
-                if (extract_json_cmd(uart_payload, uart_cmd, sizeof(uart_cmd))) {
-                    w = snprintf(line, sizeof(line), "%s\r\n", uart_cmd);
-                }
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
                     ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
