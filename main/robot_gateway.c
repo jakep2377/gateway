@@ -37,7 +37,8 @@
 // UART RX buffering
 #define UART_RX_BUF_SIZE   1024
 #define UART_LINE_MAX      512
-#define LORA_MAX_PAYLOAD   250
+#define LORA_MAX_PAYLOAD   255
+#define UART_STREAM_IDLE_FLUSH_MS  30
 
 static const char *TAG = "ROBOT_GW";
 
@@ -304,6 +305,7 @@ static void uart_rx_task(void *arg) {
     int line_len = 0;
     uint32_t stream_seq = 0;
     const int chunk_max = LORA_MAX_PAYLOAD - 16; // reserve for "S:<seq>:<M|E>:" + "\n"
+    TickType_t last_byte_tick = 0;
 
     while (1) {
         int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
@@ -326,9 +328,11 @@ static void uart_rx_task(void *arg) {
                         }
                     }
                     line_len = 0;
+                    last_byte_tick = 0;
                 } else {
                     if (line_len < chunk_max) {
                         line[line_len++] = c;
+                        last_byte_tick = xTaskGetTickCount();
                     } else {
                         // Stream is longer than one LoRa packet: send current chunk and continue.
                         line[line_len] = '\0';
@@ -342,8 +346,25 @@ static void uart_rx_task(void *arg) {
 
                         line_len = 0;
                         line[line_len++] = c;
+                        last_byte_tick = xTaskGetTickCount();
                     }
                 }
+            }
+        }
+
+        if (line_len > 0 && last_byte_tick != 0) {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_byte_tick) >= pdMS_TO_TICKS(UART_STREAM_IDLE_FLUSH_MS)) {
+                line[line_len] = '\0';
+                int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
+                                 (unsigned long)stream_seq++, line_len, line);
+                if (w > 0) {
+                    ESP_LOGI(TAG, "UART idle flush seq=%lu (%d bytes)",
+                             (unsigned long)(stream_seq - 1), line_len);
+                    lora_send_text(framed);
+                }
+                line_len = 0;
+                last_byte_tick = 0;
             }
         }
     }
