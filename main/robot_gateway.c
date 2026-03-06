@@ -13,6 +13,8 @@
 
 #include "ra01s.h"
 
+#include "driver/gpio.h"
+
 // ---------------- LoRa settings ----------------
 #define LORA_FREQ_HZ       915000000
 #define LORA_TX_POWER_DBM  22
@@ -190,6 +192,9 @@ static void uart_setup(void) {
     ESP_ERROR_CHECK(uart_set_pin(GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
+    ESP_ERROR_CHECK(gpio_pullup_en(GW_UART_RX_GPIO));
+    ESP_ERROR_CHECK(gpio_pulldown_dis(GW_UART_RX_GPIO));
+
     ESP_LOGI(TAG, "UART ready: UART%d TX=%d RX=%d @ %d",
              (int)GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO, GW_UART_BAUD);
 }
@@ -310,6 +315,11 @@ static void uart_rx_task(void *arg) {
     while (1) {
         int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
         if (r > 0) {
+            ESP_LOGI(TAG, "UART raw read: %d bytes", r);
+            for (int k = 0; k < r; k++) {
+                printf("%02X ", buf[k]);
+            }
+            printf("\n");
             for (int i = 0; i < r; i++) {
                 char c = (char)buf[i];
 
@@ -328,8 +338,7 @@ static void uart_rx_task(void *arg) {
                         }
                     }
                     line_len = 0;
-                    last_byte_tick = 0;
-                } else {
+                } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
                     if (line_len < chunk_max) {
                         line[line_len++] = c;
                         last_byte_tick = xTaskGetTickCount();
