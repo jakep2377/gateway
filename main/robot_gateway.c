@@ -41,6 +41,7 @@
 #define UART_LINE_MAX      512
 #define LORA_MAX_PAYLOAD   255
 #define UART_STREAM_IDLE_FLUSH_MS  30
+#define LORA_STREAM_CHUNK_MAX 150
 
 static const char *TAG = "ROBOT_GW";
 
@@ -309,17 +310,12 @@ static void uart_rx_task(void *arg) {
     char framed[LORA_MAX_PAYLOAD + 1];
     int line_len = 0;
     uint32_t stream_seq = 0;
-    const int chunk_max = LORA_MAX_PAYLOAD - 16; // reserve for "S:<seq>:<M|E>:" + "\n"
+    const int chunk_max = LORA_STREAM_CHUNK_MAX;
     TickType_t last_byte_tick = 0;
 
     while (1) {
         int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
         if (r > 0) {
-            ESP_LOGI(TAG, "UART raw read: %d bytes", r);
-            for (int k = 0; k < r; k++) {
-                printf("%02X ", buf[k]);
-            }
-            printf("\n");
             for (int i = 0; i < r; i++) {
                 char c = (char)buf[i];
 
@@ -338,7 +334,7 @@ static void uart_rx_task(void *arg) {
                         }
                     }
                     line_len = 0;
-                } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
+                } else {
                     if (line_len < chunk_max) {
                         line[line_len++] = c;
                         last_byte_tick = xTaskGetTickCount();
