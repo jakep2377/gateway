@@ -323,8 +323,9 @@ static void uart_rx_task(void *arg) {
     char line[UART_LINE_MAX];
     char framed[LORA_MAX_PAYLOAD + 1];
     int line_len = 0;
+    bool line_chunked = false;
     uint32_t stream_seq = 0;
-    const int chunk_max = LORA_STREAM_CHUNK_MAX;
+    const int chunk_max = (LORA_MAX_PAYLOAD > 24) ? (LORA_MAX_PAYLOAD - 24) : LORA_STREAM_CHUNK_MAX;
     TickType_t last_byte_tick = 0;
 
     while (1) {
@@ -339,15 +340,22 @@ static void uart_rx_task(void *arg) {
                 if (c == '\n') {
                     line[line_len] = '\0';
                     if (line_len > 0) {
-                        int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
-                                         (unsigned long)stream_seq++, line_len, line);
-                        if (w > 0) {
-                            ESP_LOGI(TAG, "UART RX chunk seq=%lu (%d bytes)",
-                                     (unsigned long)(stream_seq - 1), line_len);
-                            lora_send_text(framed);
+                        if (!line_chunked && line_len <= LORA_MAX_PAYLOAD) {
+                            ESP_LOGI(TAG, "UART RX direct (%d bytes)", line_len);
+                            lora_send_text(line);
+                        } else {
+                            int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
+                                             (unsigned long)stream_seq++, line_len, line);
+                            if (w > 0) {
+                                ESP_LOGI(TAG, "UART RX chunk seq=%lu (%d bytes)",
+                                         (unsigned long)(stream_seq - 1), line_len);
+                                lora_send_text(framed);
+                            }
                         }
                     }
                     line_len = 0;
+                    line_chunked = false;
+                    last_byte_tick = 0;
                 } else {
                     if (line_len < chunk_max) {
                         line[line_len++] = c;
@@ -363,6 +371,7 @@ static void uart_rx_task(void *arg) {
                             lora_send_text(framed);
                         }
 
+                        line_chunked = true;
                         line_len = 0;
                         line[line_len++] = c;
                         last_byte_tick = xTaskGetTickCount();
@@ -375,14 +384,20 @@ static void uart_rx_task(void *arg) {
             TickType_t now = xTaskGetTickCount();
             if ((now - last_byte_tick) >= pdMS_TO_TICKS(UART_STREAM_IDLE_FLUSH_MS)) {
                 line[line_len] = '\0';
-                int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
-                                 (unsigned long)stream_seq++, line_len, line);
-                if (w > 0) {
-                    ESP_LOGI(TAG, "UART idle flush seq=%lu (%d bytes)",
-                             (unsigned long)(stream_seq - 1), line_len);
-                    lora_send_text(framed);
+                if (!line_chunked && line_len <= LORA_MAX_PAYLOAD) {
+                    ESP_LOGI(TAG, "UART idle flush direct (%d bytes)", line_len);
+                    lora_send_text(line);
+                } else {
+                    int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
+                                     (unsigned long)stream_seq++, line_len, line);
+                    if (w > 0) {
+                        ESP_LOGI(TAG, "UART idle flush seq=%lu (%d bytes)",
+                                 (unsigned long)(stream_seq - 1), line_len);
+                        lora_send_text(framed);
+                    }
                 }
                 line_len = 0;
+                line_chunked = false;
                 last_byte_tick = 0;
             }
         }
