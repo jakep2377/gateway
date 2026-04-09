@@ -212,8 +212,22 @@ static void lora_send_text(const char *text) {
     }
 
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
-    LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
+    bool sent = false;
+    int send_result = 0;
+    for (int retry = 0; retry < 3; retry++) {
+        send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
+        if (send_result == 0) {
+            sent = true;
+            break;
+        }
+        ESP_LOGW(TAG, "LoRa uplink retry %d/3 failed with code %d", retry + 1, send_result);
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
     xSemaphoreGive(lora_tx_lock);
+
+    if (!sent) {
+        ESP_LOGE(TAG, "LoRa uplink failed after retries with code %d", send_result);
+    }
 }
 
 // ---------------- Tasks ----------------
