@@ -47,6 +47,7 @@
 #define LORA_STREAM_HEADER_RESERVE       24
 #define LORA_TX_RETRY_COUNT 5
 #define LORA_TX_RETRY_DELAY_MS 80
+#define GATEWAY_HEARTBEAT_INTERVAL_MS    5000
 
 static const char *TAG = "ROBOT_GW";
 
@@ -289,7 +290,7 @@ static void lora_rx_task(void *arg) {
 
                 if (!frame.has_end) {
                     char ack[80];
-                    snprintf(ack, sizeof(ack), "ACK:%.70s", (char*)rx);
+                    snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
                     lora_send_text(ack);
                     continue;
                 }
@@ -310,13 +311,29 @@ static void lora_rx_task(void *arg) {
                 }
             }
 
-            // Send ACK back over LoRa so base station can confirm delivery
+            // Send a gateway receipt marker back over LoRa without pretending the
+            // STM32 already applied the command. The real `ACK:` should come from
+            // the STM32 response that is bridged back on UART RX.
             char ack[80];
-            snprintf(ack, sizeof(ack), "ACK:%.70s", (char*)rx);
+            snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
             lora_send_text(ack);
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// Periodic gateway heartbeat -> LoRa TX
+static void gateway_heartbeat_task(void *arg) {
+    (void)arg;
+    char heartbeat[64];
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    while (1) {
+        snprintf(heartbeat, sizeof(heartbeat), "GW:ALIVE:%lu",
+                 (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+        lora_send_text(heartbeat);
+        vTaskDelay(pdMS_TO_TICKS(GATEWAY_HEARTBEAT_INTERVAL_MS));
     }
 }
 
@@ -426,6 +443,7 @@ void app_main(void) {
 
     xTaskCreate(lora_rx_task, "lora_rx", 4096, NULL, 5, NULL);
     xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(gateway_heartbeat_task, "gw_heartbeat", 2048, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "Robot gateway running: LoRa <-> UART bridge active");
 }
