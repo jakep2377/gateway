@@ -40,8 +40,13 @@
 #define UART_RX_BUF_SIZE   1024
 #define UART_LINE_MAX      512
 #define LORA_MAX_PAYLOAD   255
-#define UART_STREAM_IDLE_FLUSH_MS  30
-#define LORA_STREAM_CHUNK_MAX 150
+#define UART_STREAM_IDLE_FLUSH_MS        120
+#define UART_STREAM_SHORT_IDLE_FLUSH_MS  250
+#define UART_STREAM_MIN_FLUSH_BYTES      4
+#define LORA_STREAM_CHUNK_MAX            150
+#define LORA_STREAM_HEADER_RESERVE       24
+#define LORA_TX_RETRY_COUNT 5
+#define LORA_TX_RETRY_DELAY_MS 80
 
 static const char *TAG = "ROBOT_GW";
 
@@ -213,20 +218,19 @@ static void lora_send_text(const char *text) {
 
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
     bool sent = false;
-    int send_result = 0;
-    for (int retry = 0; retry < 3; retry++) {
-        send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
-        if (send_result == 0) {
+    for (int retry = 0; retry < LORA_TX_RETRY_COUNT; retry++) {
+        bool send_ok = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
+        if (send_ok) {
             sent = true;
             break;
         }
-        ESP_LOGW(TAG, "LoRa uplink retry %d/3 failed with code %d", retry + 1, send_result);
-        vTaskDelay(pdMS_TO_TICKS(40));
+        ESP_LOGW(TAG, "LoRa uplink retry %d/%d failed", retry + 1, LORA_TX_RETRY_COUNT);
+        vTaskDelay(pdMS_TO_TICKS(LORA_TX_RETRY_DELAY_MS));
     }
     xSemaphoreGive(lora_tx_lock);
 
     if (!sent) {
-        ESP_LOGE(TAG, "LoRa uplink failed after retries with code %d", send_result);
+        ESP_LOGE(TAG, "LoRa uplink failed after %d attempts", LORA_TX_RETRY_COUNT);
     }
 }
 
@@ -325,7 +329,12 @@ static void uart_rx_task(void *arg) {
     int line_len = 0;
     bool line_chunked = false;
     uint32_t stream_seq = 0;
-    const int chunk_max = (LORA_MAX_PAYLOAD > 24) ? (LORA_MAX_PAYLOAD - 24) : LORA_STREAM_CHUNK_MAX;
+    const int stream_payload_max = (LORA_MAX_PAYLOAD > LORA_STREAM_HEADER_RESERVE)
+        ? (LORA_MAX_PAYLOAD - LORA_STREAM_HEADER_RESERVE)
+        : LORA_MAX_PAYLOAD;
+    const int chunk_max = (stream_payload_max < LORA_STREAM_CHUNK_MAX)
+        ? stream_payload_max
+        : LORA_STREAM_CHUNK_MAX;
     TickType_t last_byte_tick = 0;
 
     while (1) {
@@ -335,7 +344,7 @@ static void uart_rx_task(void *arg) {
                 char c = (char)buf[i];
 
                 // Build stream/chunks; newline flushes the current chunk.
-                if (c == '\r') continue;
+                if (c == '\r' || c == '\0') continue;
 
                 if (c == '\n') {
                     line[line_len] = '\0';
@@ -382,7 +391,12 @@ static void uart_rx_task(void *arg) {
 
         if (line_len > 0 && last_byte_tick != 0) {
             TickType_t now = xTaskGetTickCount();
-            if ((now - last_byte_tick) >= pdMS_TO_TICKS(UART_STREAM_IDLE_FLUSH_MS)) {
+            TickType_t idle_flush_ticks = pdMS_TO_TICKS(
+                (line_len < UART_STREAM_MIN_FLUSH_BYTES)
+                    ? UART_STREAM_SHORT_IDLE_FLUSH_MS
+                    : UART_STREAM_IDLE_FLUSH_MS);
+
+            if ((now - last_byte_tick) >= idle_flush_ticks) {
                 line[line_len] = '\0';
                 if (!line_chunked && line_len <= LORA_MAX_PAYLOAD) {
                     ESP_LOGI(TAG, "UART idle flush direct (%d bytes)", line_len);
