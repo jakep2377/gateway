@@ -14,6 +14,7 @@
 #include "ra01s.h"
 
 #include "driver/gpio.h"
+#include "display.h"
 
 // ---------------- LoRa settings ----------------
 #define LORA_FREQ_HZ       915000000
@@ -52,6 +53,11 @@
 #define GATEWAY_HEARTBEAT_INTERVAL_MS    5000
 
 static const char *TAG = "ROBOT_GW";
+static bool display_available = false;
+static char s_last_downlink[32] = "none";
+static char s_last_uplink[32] = "none";
+static uint32_t s_lora_rx_count = 0;
+static uint32_t s_uart_forward_count = 0;
 
 typedef struct {
     bool is_stream;
@@ -109,6 +115,23 @@ static void make_printable(const char *in, size_t in_len, char *out, size_t out_
         }
     }
     out[j] = '\0';
+}
+
+static void update_preview_text(const char *input, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    if (!input) {
+        snprintf(out, out_size, "none");
+        return;
+    }
+
+    char printable[64];
+    make_printable(input, strnlen(input, sizeof(printable) - 1), printable, sizeof(printable));
+    char *trimmed = trim_inplace(printable);
+    snprintf(out, out_size, "%.*s", (int)((strlen(trimmed) < out_size - 1) ? strlen(trimmed) : out_size - 1), trimmed);
+    if (out[0] == '\0') {
+        snprintf(out, out_size, "none");
+    }
 }
 
 static size_t sanitize_uart_payload(const char *in, size_t in_len, char *out, size_t out_size, bool *had_nonprintable)
@@ -211,6 +234,8 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
     if (!use_stream_frame && clean_len <= LORA_MAX_PAYLOAD) {
         ESP_LOGI(TAG, "UART %s direct (%u bytes%s)",
                  reason, (unsigned)clean_len, had_nonprintable ? ", sanitized" : "");
+        update_preview_text(cleaned, s_last_uplink, sizeof(s_last_uplink));
+        s_uart_forward_count++;
         lora_send_text(cleaned);
         return;
     }
@@ -226,6 +251,8 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
                  (unsigned long)(*stream_seq - 1),
                  (unsigned)clean_len,
                  had_nonprintable ? ", sanitized" : "");
+        update_preview_text(cleaned, s_last_uplink, sizeof(s_last_uplink));
+        s_uart_forward_count++;
         lora_send_text(framed);
     }
 }
@@ -373,6 +400,8 @@ static void lora_rx_task(void *arg) {
             if (n >= sizeof(rx)) n = sizeof(rx) - 1;
             rx[n] = '\0';
             make_printable((const char *)rx, n, rx_log, sizeof(rx_log));
+            update_preview_text(rx_log, s_last_downlink, sizeof(s_last_downlink));
+            s_lora_rx_count++;
             ESP_LOGI(TAG, "LoRa RX (%d): %s", n, rx_log);
 
             // Forward to STM32 as a line-based command
@@ -460,6 +489,24 @@ static void gateway_heartbeat_task(void *arg) {
     }
 }
 
+static void gateway_display_task(void *arg) {
+    (void)arg;
+
+    while (1) {
+        if (display_available) {
+            display_show_gateway_status(
+                "READY",
+                "ONLINE",
+                "BRIDGE",
+                s_last_downlink,
+                s_last_uplink,
+                s_lora_rx_count,
+                s_uart_forward_count);
+        }
+        vTaskDelay(pdMS_TO_TICKS(700));
+    }
+}
+
 // UART RX -> LoRa TX
 static void uart_rx_task(void *arg) {
     (void)arg;
@@ -533,10 +580,14 @@ void app_main(void) {
 
     uart_setup();
     lora_setup();
+    display_available = display_init();
 
     xTaskCreate(lora_rx_task, "lora_rx", 4096, NULL, 5, NULL);
     xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL);
     xTaskCreate(gateway_heartbeat_task, "gw_heartbeat", 2048, NULL, 3, NULL);
+    if (display_available) {
+        xTaskCreate(gateway_display_task, "gw_display", 3072, NULL, 2, NULL);
+    }
 
     ESP_LOGI(TAG, "Robot gateway running: LoRa <-> UART bridge active");
 }
