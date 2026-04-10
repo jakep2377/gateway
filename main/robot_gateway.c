@@ -43,6 +43,8 @@
 #define UART_STREAM_IDLE_FLUSH_MS        120
 #define UART_STREAM_SHORT_IDLE_FLUSH_MS  250
 #define UART_STREAM_MIN_FLUSH_BYTES      4
+#define UART_BINARY_DROP_MAX_BYTES       3
+#define UART_BINARY_HEX_MAX_BYTES        24
 #define LORA_STREAM_CHUNK_MAX            150
 #define LORA_STREAM_HEADER_RESERVE       24
 #define LORA_TX_RETRY_COUNT 5
@@ -65,6 +67,8 @@ static bool rx_seq_init = false;
 static uint32_t rx_seq_expected = 0;
 static char rx_stream_buf[UART_LINE_MAX];
 static int rx_stream_len = 0;
+
+static void lora_send_text(const char *text);
 
 // ---------------- Helpers ----------------
 
@@ -105,6 +109,125 @@ static void make_printable(const char *in, size_t in_len, char *out, size_t out_
         }
     }
     out[j] = '\0';
+}
+
+static size_t sanitize_uart_payload(const char *in, size_t in_len, char *out, size_t out_size, bool *had_nonprintable)
+{
+    if (had_nonprintable) *had_nonprintable = false;
+    if (!out || out_size == 0) return 0;
+    if (!in || in_len == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+
+    size_t j = 0;
+    bool saw_nonprintable = false;
+    for (size_t i = 0; i < in_len && j + 1 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+
+        if (c == '\0' || c == '\r') {
+            continue;
+        }
+        if (c == '\t') {
+            c = ' ';
+        }
+
+        if (c >= 32 && c <= 126) {
+            out[j++] = (char)c;
+        } else {
+            saw_nonprintable = true;
+        }
+    }
+    out[j] = '\0';
+
+    char *trimmed = trim_inplace(out);
+    if (trimmed != out) {
+        memmove(out, trimmed, strlen(trimmed) + 1);
+    }
+
+    if (had_nonprintable) *had_nonprintable = saw_nonprintable;
+    return strlen(out);
+}
+
+static size_t format_uart_binary_hex(const uint8_t *in, size_t in_len, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    if (!in || in_len == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+
+    size_t limit = (in_len < UART_BINARY_HEX_MAX_BYTES) ? in_len : UART_BINARY_HEX_MAX_BYTES;
+    size_t j = 0;
+
+    int prefix = snprintf(out, out_size, "HEX:");
+    if (prefix < 0 || (size_t)prefix >= out_size) {
+        out[0] = '\0';
+        return 0;
+    }
+    j = (size_t)prefix;
+
+    for (size_t i = 0; i < limit && j + 2 < out_size; i++) {
+        int w = snprintf(out + j, out_size - j, "%02X", in[i]);
+        if (w != 2) break;
+        j += 2;
+    }
+
+    if (limit < in_len && j + 4 < out_size) {
+        memcpy(out + j, "...", 4);
+        j += 3;
+    }
+
+    return j;
+}
+
+static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_stream_frame,
+                                         bool final_chunk, uint32_t *stream_seq, const char *reason)
+{
+    if (!raw || raw_len <= 0) return;
+
+    char cleaned[UART_LINE_MAX];
+    bool had_nonprintable = false;
+    size_t clean_len = sanitize_uart_payload(raw, (size_t)raw_len, cleaned, sizeof(cleaned), &had_nonprintable);
+
+    if (clean_len == 0) {
+        if (had_nonprintable) {
+            if (raw_len <= UART_BINARY_DROP_MAX_BYTES) {
+                ESP_LOGI(TAG, "Ignoring tiny binary UART %s (%d raw bytes)", reason, raw_len);
+                return;
+            }
+
+            char hex_msg[LORA_MAX_PAYLOAD + 1];
+            size_t hex_len = format_uart_binary_hex((const uint8_t *)raw, (size_t)raw_len,
+                                                    hex_msg, sizeof(hex_msg));
+            if (hex_len > 0) {
+                ESP_LOGI(TAG, "UART %s binary (%d raw bytes)", reason, raw_len);
+                lora_send_text(hex_msg);
+            }
+        }
+        return;
+    }
+
+    if (!use_stream_frame && clean_len <= LORA_MAX_PAYLOAD) {
+        ESP_LOGI(TAG, "UART %s direct (%u bytes%s)",
+                 reason, (unsigned)clean_len, had_nonprintable ? ", sanitized" : "");
+        lora_send_text(cleaned);
+        return;
+    }
+
+    char framed[LORA_MAX_PAYLOAD + 1];
+    int w = snprintf(framed, sizeof(framed), "S:%lu:%c:%.*s\n",
+                     (unsigned long)(*stream_seq)++,
+                     final_chunk ? 'E' : 'M',
+                     (int)clean_len, cleaned);
+    if (w > 0) {
+        ESP_LOGI(TAG, "UART %s seq=%lu (%u bytes%s)",
+                 reason,
+                 (unsigned long)(*stream_seq - 1),
+                 (unsigned)clean_len,
+                 had_nonprintable ? ", sanitized" : "");
+        lora_send_text(framed);
+    }
 }
 
 static stream_frame_t parse_stream_frame(char *text)
@@ -342,7 +465,6 @@ static void uart_rx_task(void *arg) {
     (void)arg;
     uint8_t buf[UART_RX_BUF_SIZE];
     char line[UART_LINE_MAX];
-    char framed[LORA_MAX_PAYLOAD + 1];
     int line_len = 0;
     bool line_chunked = false;
     uint32_t stream_seq = 0;
@@ -364,20 +486,9 @@ static void uart_rx_task(void *arg) {
                 if (c == '\r' || c == '\0') continue;
 
                 if (c == '\n') {
-                    line[line_len] = '\0';
                     if (line_len > 0) {
-                        if (!line_chunked && line_len <= LORA_MAX_PAYLOAD) {
-                            ESP_LOGI(TAG, "UART RX direct (%d bytes)", line_len);
-                            lora_send_text(line);
-                        } else {
-                            int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
-                                             (unsigned long)stream_seq++, line_len, line);
-                            if (w > 0) {
-                                ESP_LOGI(TAG, "UART RX chunk seq=%lu (%d bytes)",
-                                         (unsigned long)(stream_seq - 1), line_len);
-                                lora_send_text(framed);
-                            }
-                        }
+                        forward_uart_payload_to_lora(line, line_len, line_chunked, true,
+                                                     &stream_seq, line_chunked ? "RX final chunk" : "RX");
                     }
                     line_len = 0;
                     line_chunked = false;
@@ -388,15 +499,8 @@ static void uart_rx_task(void *arg) {
                         last_byte_tick = xTaskGetTickCount();
                     } else {
                         // Stream is longer than one LoRa packet: send current chunk and continue.
-                        line[line_len] = '\0';
-                        int w = snprintf(framed, sizeof(framed), "S:%lu:M:%.*s\n",
-                                         (unsigned long)stream_seq++, line_len, line);
-                        if (w > 0) {
-                            ESP_LOGI(TAG, "UART stream chunk seq=%lu (%d bytes)",
-                                     (unsigned long)(stream_seq - 1), line_len);
-                            lora_send_text(framed);
-                        }
-
+                        forward_uart_payload_to_lora(line, line_len, true, false,
+                                                     &stream_seq, "stream chunk");
                         line_chunked = true;
                         line_len = 0;
                         line[line_len++] = c;
@@ -414,19 +518,8 @@ static void uart_rx_task(void *arg) {
                     : UART_STREAM_IDLE_FLUSH_MS);
 
             if ((now - last_byte_tick) >= idle_flush_ticks) {
-                line[line_len] = '\0';
-                if (!line_chunked && line_len <= LORA_MAX_PAYLOAD) {
-                    ESP_LOGI(TAG, "UART idle flush direct (%d bytes)", line_len);
-                    lora_send_text(line);
-                } else {
-                    int w = snprintf(framed, sizeof(framed), "S:%lu:E:%.*s\n",
-                                     (unsigned long)stream_seq++, line_len, line);
-                    if (w > 0) {
-                        ESP_LOGI(TAG, "UART idle flush seq=%lu (%d bytes)",
-                                 (unsigned long)(stream_seq - 1), line_len);
-                        lora_send_text(framed);
-                    }
-                }
+                forward_uart_payload_to_lora(line, line_len, line_chunked, true,
+                                             &stream_seq, "idle flush");
                 line_len = 0;
                 line_chunked = false;
                 last_byte_tick = 0;
