@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "driver/uart.h"
@@ -38,19 +39,23 @@
 #define GW_UART_RX_GPIO    7
 
 // UART RX buffering
-#define UART_RX_BUF_SIZE   1024
+#define UART_RX_BUF_SIZE   4096
 #define UART_LINE_MAX      512
 #define LORA_MAX_PAYLOAD   255
 #define UART_STREAM_IDLE_FLUSH_MS        120
-#define UART_STREAM_SHORT_IDLE_FLUSH_MS  250
-#define UART_STREAM_MIN_FLUSH_BYTES      4
+#define UART_STREAM_SHORT_IDLE_FLUSH_MS  200
+#define UART_STREAM_MIN_FLUSH_BYTES      8
 #define UART_BINARY_DROP_MAX_BYTES       3
 #define UART_BINARY_HEX_MAX_BYTES        24
 #define LORA_STREAM_CHUNK_MAX            150
 #define LORA_STREAM_HEADER_RESERVE       24
 #define LORA_TX_RETRY_COUNT 5
 #define LORA_TX_RETRY_DELAY_MS 80
-#define GATEWAY_HEARTBEAT_INTERVAL_MS    5000
+#define LORA_TX_QUEUE_LEN 48
+#define LORA_TX_QUEUE_WAIT_MS 20
+#define GATEWAY_HEARTBEAT_INTERVAL_MS    1500
+#define GATEWAY_ACTIVITY_READY_MS        8000
+#define GATEWAY_ACTIVITY_WARN_MS         90000
 
 static const char *TAG = "ROBOT_GW";
 static bool display_available = false;
@@ -58,6 +63,11 @@ static char s_last_downlink[32] = "none";
 static char s_last_uplink[32] = "none";
 static uint32_t s_lora_rx_count = 0;
 static uint32_t s_uart_forward_count = 0;
+static char s_gateway_mode[16] = "BOOT";
+static char s_lora_status[16] = "IDLE";
+static char s_uart_status[16] = "IDLE";
+static TickType_t s_last_lora_activity_tick = 0;
+static TickType_t s_last_uart_activity_tick = 0;
 
 typedef struct {
     bool is_stream;
@@ -66,14 +76,24 @@ typedef struct {
     const char *payload;
 } stream_frame_t;
 
+typedef struct {
+    char payload[LORA_MAX_PAYLOAD + 1];
+} lora_tx_item_t;
+
 // Simple mutex around LoRa send
 static SemaphoreHandle_t lora_tx_lock;
+static QueueHandle_t s_lora_tx_queue = NULL;
+static QueueHandle_t s_uart_event_queue = NULL;
+static uint32_t s_lora_tx_queue_drops = 0;
+static uint32_t s_uart_overflow_count = 0;
 
 static bool rx_seq_init = false;
 static uint32_t rx_seq_expected = 0;
 static char rx_stream_buf[UART_LINE_MAX];
 static int rx_stream_len = 0;
+static uint8_t s_uart_rx_buf[UART_RX_BUF_SIZE];
 
+static void lora_send_text_blocking(const char *text);
 static void lora_send_text(const char *text);
 
 // ---------------- Helpers ----------------
@@ -131,6 +151,70 @@ static void update_preview_text(const char *input, char *out, size_t out_size)
     snprintf(out, out_size, "%.*s", (int)((strlen(trimmed) < out_size - 1) ? strlen(trimmed) : out_size - 1), trimmed);
     if (out[0] == '\0') {
         snprintf(out, out_size, "none");
+    }
+}
+
+static void set_status_text(char *target, size_t target_size, const char *value)
+{
+    if (!target || target_size == 0) return;
+    snprintf(target, target_size, "%s", value ? value : "none");
+}
+
+static bool preview_present(const char *value)
+{
+    return value && value[0] != '\0' && strcmp(value, "none") != 0;
+}
+
+static void note_lora_activity(void)
+{
+    s_last_lora_activity_tick = xTaskGetTickCount();
+    set_status_text(s_lora_status, sizeof(s_lora_status), "ONLINE");
+}
+
+static void note_uart_activity(void)
+{
+    s_last_uart_activity_tick = xTaskGetTickCount();
+    set_status_text(s_uart_status, sizeof(s_uart_status), "BRIDGE");
+}
+
+static void refresh_gateway_display_states(void)
+{
+    const TickType_t now = xTaskGetTickCount();
+    const bool lora_seen = (s_lora_rx_count > 0) || preview_present(s_last_downlink);
+    const bool uart_seen = (s_uart_forward_count > 0) || preview_present(s_last_uplink);
+    const uint32_t lora_age_ms = s_last_lora_activity_tick == 0
+        ? UINT32_MAX
+        : (uint32_t)((now - s_last_lora_activity_tick) * portTICK_PERIOD_MS);
+    const uint32_t uart_age_ms = s_last_uart_activity_tick == 0
+        ? UINT32_MAX
+        : (uint32_t)((now - s_last_uart_activity_tick) * portTICK_PERIOD_MS);
+
+    if (!lora_seen) {
+        set_status_text(s_lora_status, sizeof(s_lora_status), "IDLE");
+    } else if (lora_age_ms <= GATEWAY_ACTIVITY_READY_MS) {
+        set_status_text(s_lora_status, sizeof(s_lora_status), "ONLINE");
+    } else if (lora_age_ms <= GATEWAY_ACTIVITY_WARN_MS) {
+        set_status_text(s_lora_status, sizeof(s_lora_status), "STALE");
+    } else {
+        set_status_text(s_lora_status, sizeof(s_lora_status), "WARN");
+    }
+
+    if (!uart_seen) {
+        set_status_text(s_uart_status, sizeof(s_uart_status), "IDLE");
+    } else if (uart_age_ms <= GATEWAY_ACTIVITY_READY_MS) {
+        set_status_text(s_uart_status, sizeof(s_uart_status), "BRIDGE");
+    } else if (uart_age_ms <= GATEWAY_ACTIVITY_WARN_MS) {
+        set_status_text(s_uart_status, sizeof(s_uart_status), "IDLE");
+    } else {
+        set_status_text(s_uart_status, sizeof(s_uart_status), "WARN");
+    }
+
+    if (strcmp(s_lora_status, "WARN") == 0 && strcmp(s_uart_status, "WARN") == 0) {
+        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WARN");
+    } else if (lora_seen || uart_seen) {
+        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
+    } else {
+        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "SETUP");
     }
 }
 
@@ -236,6 +320,7 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
                  reason, (unsigned)clean_len, had_nonprintable ? ", sanitized" : "");
         update_preview_text(cleaned, s_last_uplink, sizeof(s_last_uplink));
         s_uart_forward_count++;
+        note_uart_activity();
         lora_send_text(cleaned);
         return;
     }
@@ -253,6 +338,7 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
                  had_nonprintable ? ", sanitized" : "");
         update_preview_text(cleaned, s_last_uplink, sizeof(s_last_uplink));
         s_uart_forward_count++;
+        note_uart_activity();
         lora_send_text(framed);
     }
 }
@@ -329,6 +415,8 @@ static void lora_setup(void) {
     LoRaConfig(LORA_SF, LORA_BW, LORA_CR,
                LORA_PREAMBLE, LORA_PAYLOAD_LEN, LORA_CRC_ON, LORA_INVERT_IRQ);
 
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "SETUP");
+    set_status_text(s_lora_status, sizeof(s_lora_status), "READY");
     ESP_LOGI(TAG, "LoRa ready @ %d Hz", (int)LORA_FREQ_HZ);
 }
 
@@ -344,7 +432,7 @@ static void uart_setup(void) {
         .source_clk = UART_SCLK_DEFAULT
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, 0, 20, &s_uart_event_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(GW_UART, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -352,12 +440,12 @@ static void uart_setup(void) {
     ESP_ERROR_CHECK(gpio_pullup_en(GW_UART_RX_GPIO));
     ESP_ERROR_CHECK(gpio_pulldown_dis(GW_UART_RX_GPIO));
 
+    set_status_text(s_uart_status, sizeof(s_uart_status), "READY");
     ESP_LOGI(TAG, "UART ready: UART%d TX=%d RX=%d @ %d",
              (int)GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO, GW_UART_BAUD);
 }
 
-// Send a LoRa packet safely from any task
-static void lora_send_text(const char *text) {
+static void lora_send_text_blocking(const char *text) {
     if (!text) return;
     size_t n = strnlen(text, UART_LINE_MAX - 1);
     if (n == 0) return;
@@ -385,6 +473,37 @@ static void lora_send_text(const char *text) {
     }
 }
 
+// Send a LoRa packet safely from any task without stalling producers.
+static void lora_send_text(const char *text) {
+    if (!text) return;
+
+    if (!s_lora_tx_queue) {
+        lora_send_text_blocking(text);
+        return;
+    }
+
+    lora_tx_item_t item = {0};
+    snprintf(item.payload, sizeof(item.payload), "%s", text);
+
+    if (xQueueSend(s_lora_tx_queue, &item, pdMS_TO_TICKS(LORA_TX_QUEUE_WAIT_MS)) != pdTRUE) {
+        s_lora_tx_queue_drops++;
+        if ((s_lora_tx_queue_drops % 10U) == 1U) {
+            ESP_LOGW(TAG, "LoRa TX queue full, dropped=%lu", (unsigned long)s_lora_tx_queue_drops);
+        }
+    }
+}
+
+static void lora_tx_task(void *arg) {
+    (void)arg;
+    lora_tx_item_t item;
+
+    while (1) {
+        if (xQueueReceive(s_lora_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
+            lora_send_text_blocking(item.payload);
+        }
+    }
+}
+
 // ---------------- Tasks ----------------
 
 // LoRa RX -> UART TX + ACK
@@ -402,6 +521,7 @@ static void lora_rx_task(void *arg) {
             make_printable((const char *)rx, n, rx_log, sizeof(rx_log));
             update_preview_text(rx_log, s_last_downlink, sizeof(s_last_downlink));
             s_lora_rx_count++;
+            note_lora_activity();
             ESP_LOGI(TAG, "LoRa RX (%d): %s", n, rx_log);
 
             // Forward to STM32 as a line-based command
@@ -450,6 +570,7 @@ static void lora_rx_task(void *arg) {
                 int w = snprintf(line, sizeof(line), "%s\r\n", rx_stream_buf);
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
+                    note_uart_activity();
                     ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
                 }
                 rx_stream_len = 0;
@@ -459,6 +580,7 @@ static void lora_rx_task(void *arg) {
                 int w = snprintf(line, sizeof(line), "%s\r\n", uart_payload);
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
+                    note_uart_activity();
                     ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
                 }
             }
@@ -494,10 +616,11 @@ static void gateway_display_task(void *arg) {
 
     while (1) {
         if (display_available) {
+            refresh_gateway_display_states();
             display_show_gateway_status(
-                "READY",
-                "ONLINE",
-                "BRIDGE",
+                s_gateway_mode,
+                s_lora_status,
+                s_uart_status,
                 s_last_downlink,
                 s_last_uplink,
                 s_lora_rx_count,
@@ -510,7 +633,6 @@ static void gateway_display_task(void *arg) {
 // UART RX -> LoRa TX
 static void uart_rx_task(void *arg) {
     (void)arg;
-    uint8_t buf[UART_RX_BUF_SIZE];
     char line[UART_LINE_MAX];
     int line_len = 0;
     bool line_chunked = false;
@@ -524,10 +646,25 @@ static void uart_rx_task(void *arg) {
     TickType_t last_byte_tick = 0;
 
     while (1) {
-        int r = uart_read_bytes(GW_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
+        if (s_uart_event_queue) {
+            uart_event_t event;
+            while (xQueueReceive(s_uart_event_queue, &event, 0) == pdTRUE) {
+                if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
+                    s_uart_overflow_count++;
+                    ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input",
+                             (int)event.type, (unsigned long)s_uart_overflow_count);
+                    uart_flush_input(GW_UART);
+                    xQueueReset(s_uart_event_queue);
+                } else if (event.type == UART_PARITY_ERR || event.type == UART_FRAME_ERR) {
+                    ESP_LOGW(TAG, "UART line error type=%d", (int)event.type);
+                }
+            }
+        }
+
+        int r = uart_read_bytes(GW_UART, s_uart_rx_buf, sizeof(s_uart_rx_buf), pdMS_TO_TICKS(200));
         if (r > 0) {
             for (int i = 0; i < r; i++) {
-                char c = (char)buf[i];
+            char c = (char)s_uart_rx_buf[i];
 
                 // Build stream/chunks; newline flushes the current chunk.
                 if (c == '\r' || c == '\0') continue;
@@ -577,17 +714,26 @@ static void uart_rx_task(void *arg) {
 
 void app_main(void) {
     lora_tx_lock = xSemaphoreCreateMutex();
+    s_lora_tx_queue = xQueueCreate(LORA_TX_QUEUE_LEN, sizeof(lora_tx_item_t));
+    if (!lora_tx_lock || !s_lora_tx_queue) {
+        ESP_LOGE(TAG, "Failed to create gateway sync primitives");
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
 
     uart_setup();
     lora_setup();
     display_available = display_init();
 
+    xTaskCreate(lora_tx_task, "lora_tx", 4096, NULL, 6, NULL);
     xTaskCreate(lora_rx_task, "lora_rx", 4096, NULL, 5, NULL);
-    xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(uart_rx_task, "uart_rx", 6144, NULL, 5, NULL);
     xTaskCreate(gateway_heartbeat_task, "gw_heartbeat", 2048, NULL, 3, NULL);
     if (display_available) {
         xTaskCreate(gateway_display_task, "gw_display", 3072, NULL, 2, NULL);
     }
 
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
     ESP_LOGI(TAG, "Robot gateway running: LoRa <-> UART bridge active");
 }
