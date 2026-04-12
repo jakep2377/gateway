@@ -465,11 +465,11 @@ static void lora_send_text_blocking(const char *text) {
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
     bool sent = false;
     for (int retry = 0; retry < LORA_TX_RETRY_COUNT; retry++) {
-        bool send_ok = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
-        if (send_ok) {
+        int send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
+        if (send_result == 0) {
             sent = true;
             break;
-        }
+}
         ESP_LOGW(TAG, "LoRa uplink retry %d/%d failed", retry + 1, LORA_TX_RETRY_COUNT);
         vTaskDelay(pdMS_TO_TICKS(LORA_TX_RETRY_DELAY_MS));
     }
