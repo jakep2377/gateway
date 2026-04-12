@@ -33,26 +33,33 @@
 
 // ---------------- UART settings ----------------
 #define GW_UART            UART_NUM_1
-#define GW_UART_BAUD       115200
+#define GW_UART_BAUD       460800
 
 #define GW_UART_TX_GPIO    6
 #define GW_UART_RX_GPIO    7
 
 // UART RX buffering
-#define UART_RX_BUF_SIZE   4096
-#define UART_LINE_MAX      512
+#define UART_RX_BUF_SIZE   16384
+#define UART_LINE_MAX      1024
+#define UART_EVENT_QUEUE_LEN 64
 #define LORA_MAX_PAYLOAD   255
-#define UART_STREAM_IDLE_FLUSH_MS        120
-#define UART_STREAM_SHORT_IDLE_FLUSH_MS  200
+#define UART_STREAM_IDLE_FLUSH_MS        30
+#define UART_STREAM_SHORT_IDLE_FLUSH_MS  45
 #define UART_STREAM_MIN_FLUSH_BYTES      8
+#define UART_READ_TIMEOUT_MS             20
 #define UART_BINARY_DROP_MAX_BYTES       3
 #define UART_BINARY_HEX_MAX_BYTES        24
 #define LORA_STREAM_CHUNK_MAX            150
 #define LORA_STREAM_HEADER_RESERVE       24
 #define LORA_TX_RETRY_COUNT 5
-#define LORA_TX_RETRY_DELAY_MS 80
-#define LORA_TX_QUEUE_LEN 48
-#define LORA_TX_QUEUE_WAIT_MS 20
+#define LORA_TX_RETRY_DELAY_MS 35
+#define LORA_TX_QUEUE_LEN 128
+#define LORA_TX_QUEUE_WAIT_MS 5
+#define TASK_STACK_LORA_TX 6144
+#define TASK_STACK_LORA_RX 6144
+#define TASK_STACK_UART_RX 10240
+#define TASK_STACK_HEARTBEAT 3072
+#define TASK_STACK_DISPLAY 4096
 #define GATEWAY_HEARTBEAT_INTERVAL_MS    1500
 #define GATEWAY_ACTIVITY_READY_MS        8000
 #define GATEWAY_ACTIVITY_WARN_MS         90000
@@ -432,7 +439,7 @@ static void uart_setup(void) {
         .source_clk = UART_SCLK_DEFAULT
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, 0, 20, &s_uart_event_queue, 0));
+    ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, 0, UART_EVENT_QUEUE_LEN, &s_uart_event_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(GW_UART, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -593,7 +600,7 @@ static void lora_rx_task(void *arg) {
             lora_send_text(ack);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -661,7 +668,7 @@ static void uart_rx_task(void *arg) {
             }
         }
 
-        int r = uart_read_bytes(GW_UART, s_uart_rx_buf, sizeof(s_uart_rx_buf), pdMS_TO_TICKS(200));
+        int r = uart_read_bytes(GW_UART, s_uart_rx_buf, sizeof(s_uart_rx_buf), pdMS_TO_TICKS(UART_READ_TIMEOUT_MS));
         if (r > 0) {
             for (int i = 0; i < r; i++) {
             char c = (char)s_uart_rx_buf[i];
@@ -726,12 +733,12 @@ void app_main(void) {
     lora_setup();
     display_available = display_init();
 
-    xTaskCreate(lora_tx_task, "lora_tx", 4096, NULL, 6, NULL);
-    xTaskCreate(lora_rx_task, "lora_rx", 4096, NULL, 5, NULL);
-    xTaskCreate(uart_rx_task, "uart_rx", 6144, NULL, 5, NULL);
-    xTaskCreate(gateway_heartbeat_task, "gw_heartbeat", 2048, NULL, 3, NULL);
+    xTaskCreate(lora_tx_task, "lora_tx", TASK_STACK_LORA_TX, NULL, 6, NULL);
+    xTaskCreate(lora_rx_task, "lora_rx", TASK_STACK_LORA_RX, NULL, 5, NULL);
+    xTaskCreate(uart_rx_task, "uart_rx", TASK_STACK_UART_RX, NULL, 5, NULL);
+    xTaskCreate(gateway_heartbeat_task, "gw_heartbeat", TASK_STACK_HEARTBEAT, NULL, 3, NULL);
     if (display_available) {
-        xTaskCreate(gateway_display_task, "gw_display", 3072, NULL, 2, NULL);
+        xTaskCreate(gateway_display_task, "gw_display", TASK_STACK_DISPLAY, NULL, 2, NULL);
     }
 
     set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
