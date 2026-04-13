@@ -30,39 +30,61 @@
 #define LORA_PAYLOAD_LEN   0
 #define LORA_CRC_ON        true
 #define LORA_INVERT_IRQ    false
+#define GFSK_BITRATE_BPS   100000U
+#define GFSK_FREQ_DEV_HZ   50000U
+#define GFSK_RX_BW         SX126X_GFSK_RX_BW_156_2
+#define GFSK_PREAMBLE_BITS 32U
+#define GFSK_SYNC_WORD_BITS 32U
+#define GFSK_FIXED_PAYLOAD_LEN 64U
 
 // ---------------- UART settings ----------------
 #define GW_UART            UART_NUM_1
-#define GW_UART_BAUD       460800
+#define GW_UART_BAUD       921600
 
 #define GW_UART_TX_GPIO    6
 #define GW_UART_RX_GPIO    7
 
 // UART RX buffering
 #define UART_RX_BUF_SIZE   16384
+#define UART_TX_BUF_SIZE   8192
 #define UART_LINE_MAX      1024
 #define UART_EVENT_QUEUE_LEN 64
 #define LORA_MAX_PAYLOAD   255
-#define UART_STREAM_IDLE_FLUSH_MS        30
-#define UART_STREAM_SHORT_IDLE_FLUSH_MS  45
+#define UART_STREAM_IDLE_FLUSH_MS        20
+#define UART_STREAM_SHORT_IDLE_FLUSH_MS  40
 #define UART_STREAM_MIN_FLUSH_BYTES      8
-#define UART_READ_TIMEOUT_MS             20
+#define UART_READ_TIMEOUT_MS             15
+#define UART_RX_MAX_BYTES_PER_PASS        128
+#define UART_RX_MAX_PASSES_PER_CYCLE      1
+#define UART_RX_DRAIN_PAUSE_MS            5
+#define UART_RX_LOOP_PAUSE_MS             10
 #define UART_BINARY_DROP_MAX_BYTES       3
 #define UART_BINARY_HEX_MAX_BYTES        24
-#define LORA_STREAM_CHUNK_MAX            150
+#define LORA_STREAM_CHUNK_MAX            220
 #define LORA_STREAM_HEADER_RESERVE       24
 #define LORA_TX_RETRY_COUNT 5
-#define LORA_TX_RETRY_DELAY_MS 35
+#define LORA_TX_RETRY_DELAY_MS 25
 #define LORA_TX_QUEUE_LEN 128
-#define LORA_TX_QUEUE_WAIT_MS 5
+#define LORA_TX_QUEUE_WAIT_MS 3
 #define TASK_STACK_LORA_TX 6144
 #define TASK_STACK_LORA_RX 6144
 #define TASK_STACK_UART_RX 10240
 #define TASK_STACK_HEARTBEAT 3072
 #define TASK_STACK_DISPLAY 4096
-#define GATEWAY_HEARTBEAT_INTERVAL_MS    1500
+#define GATEWAY_APP_CORE 1
+#define UART_RX_TASK_CORE tskNO_AFFINITY
+#define TASK_PRIO_LORA_TX 4
+#define TASK_PRIO_LORA_RX 3
+#define TASK_PRIO_UART_RX 1
+#define TASK_PRIO_HEARTBEAT 1
+#define TASK_PRIO_DISPLAY 1
+#define LORA_RX_POLL_DELAY_MS           5
+#define GATEWAY_HEARTBEAT_INTERVAL_MS    12000
 #define GATEWAY_ACTIVITY_READY_MS        8000
 #define GATEWAY_ACTIVITY_WARN_MS         90000
+#define LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS 30
+#define MANUAL_DOWNLINK_GUARD_MS         140
+#define GATEWAY_MOTION_LOG_THROTTLE_MS   1000
 
 static const char *TAG = "ROBOT_GW";
 static bool display_available = false;
@@ -75,6 +97,11 @@ static char s_lora_status[16] = "IDLE";
 static char s_uart_status[16] = "IDLE";
 static TickType_t s_last_lora_activity_tick = 0;
 static TickType_t s_last_uart_activity_tick = 0;
+
+typedef enum {
+    RADIO_MODE_LORA = 0,
+    RADIO_MODE_GFSK = 1,
+} radio_mode_t;
 
 typedef struct {
     bool is_stream;
@@ -93,15 +120,24 @@ static QueueHandle_t s_lora_tx_queue = NULL;
 static QueueHandle_t s_uart_event_queue = NULL;
 static uint32_t s_lora_tx_queue_drops = 0;
 static uint32_t s_uart_overflow_count = 0;
+static uint32_t s_noisy_uplink_suppressed = 0;
+static TickType_t s_last_noisy_uplink_log_tick = 0;
+static TickType_t s_last_low_priority_uplink_tick = 0;
+static TickType_t s_last_manual_downlink_tick = 0;
 
 static bool rx_seq_init = false;
 static uint32_t rx_seq_expected = 0;
 static char rx_stream_buf[UART_LINE_MAX];
 static int rx_stream_len = 0;
 static uint8_t s_uart_rx_buf[UART_RX_BUF_SIZE];
+static volatile radio_mode_t s_radio_mode = RADIO_MODE_LORA;
+
+static const char RADIO_SWITCH_TO_GFSK_FRAME[] = "RADIO:GFSK";
+static const char RADIO_SWITCH_TO_LORA_FRAME[] = "RADIO:LORA";
 
 static void lora_send_text_blocking(const char *text);
 static void lora_send_text(const char *text);
+static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size);
 
 // ---------------- Helpers ----------------
 
@@ -165,6 +201,142 @@ static void set_status_text(char *target, size_t target_size, const char *value)
 {
     if (!target || target_size == 0) return;
     snprintf(target, target_size, "%s", value ? value : "none");
+}
+
+static const char *radio_mode_name(radio_mode_t mode)
+{
+    return mode == RADIO_MODE_GFSK ? "GFSK" : "LORA";
+}
+
+static size_t radio_payload_limit(void)
+{
+    return (s_radio_mode == RADIO_MODE_GFSK) ? GFSK_FIXED_PAYLOAD_LEN : LORA_MAX_PAYLOAD;
+}
+
+static bool is_radio_switch_frame(const char *payload, radio_mode_t *target_mode)
+{
+    if (!payload) {
+        return false;
+    }
+    if (strcmp(payload, RADIO_SWITCH_TO_GFSK_FRAME) == 0) {
+        if (target_mode) {
+            *target_mode = RADIO_MODE_GFSK;
+        }
+        return true;
+    }
+    if (strcmp(payload, RADIO_SWITCH_TO_LORA_FRAME) == 0) {
+        if (target_mode) {
+            *target_mode = RADIO_MODE_LORA;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool is_high_priority_manual_uplink(const char *payload)
+{
+    if (!payload || payload[0] == '\0') {
+        return false;
+    }
+    if (strncmp(payload, "ACK:", 4) == 0) {
+        return true;
+    }
+    return strncmp(payload, "F:", 2) == 0 ||
+           strncmp(payload, "FAULT", 5) == 0 ||
+           strstr(payload, "ESTOP") != NULL;
+}
+
+static bool is_manual_downlink_command(const char *payload)
+{
+    if (!payload || payload[0] == '\0') {
+        return false;
+    }
+    return strncmp(payload, "D:", 2) == 0 ||
+           strncmp(payload, "DRIVE,", 6) == 0 ||
+           strcmp(payload, "FORWARD") == 0 ||
+           strcmp(payload, "BACKWARD") == 0 ||
+           strcmp(payload, "LEFT") == 0 ||
+           strcmp(payload, "RIGHT") == 0 ||
+           strcmp(payload, "STOP") == 0;
+}
+
+static bool should_suppress_uplink_in_manual_mode(const char *payload)
+{
+    return s_radio_mode == RADIO_MODE_GFSK && !is_high_priority_manual_uplink(payload);
+}
+
+static bool is_noisy_console_uplink(const char *payload)
+{
+    if (!payload || payload[0] == '\0') {
+        return false;
+    }
+
+    return strstr(payload, "[HEALTH] GPS: TIMEOUT") != NULL ||
+           strstr(payload, "[HEALTH] GPS: DEGRADED") != NULL ||
+           strstr(payload, "[RC] Health check") != NULL ||
+           strstr(payload, "[CONSOLE] USART2 RX recovered") != NULL;
+}
+
+static bool should_drop_uart_uplink(const char *payload)
+{
+    if (!payload || payload[0] == '\0') {
+        return false;
+    }
+
+    if (is_high_priority_manual_uplink(payload)) {
+        return false;
+    }
+
+    if (is_noisy_console_uplink(payload)) {
+        return true;
+    }
+
+    return should_suppress_uplink_in_manual_mode(payload);
+}
+
+static bool should_rate_limit_low_priority_uplink(const char *payload)
+{
+    if (!payload || payload[0] == '\0') {
+        return false;
+    }
+
+    if (is_high_priority_manual_uplink(payload)) {
+        return false;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (s_last_manual_downlink_tick != 0 &&
+        (now - s_last_manual_downlink_tick) < pdMS_TO_TICKS(MANUAL_DOWNLINK_GUARD_MS)) {
+        return true;
+    }
+
+    if (s_last_low_priority_uplink_tick != 0 &&
+        (now - s_last_low_priority_uplink_tick) < pdMS_TO_TICKS(LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS)) {
+        return true;
+    }
+
+    s_last_low_priority_uplink_tick = now;
+    return false;
+}
+
+static void gateway_apply_radio_mode(radio_mode_t mode)
+{
+    if (lora_tx_lock) {
+        xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
+    }
+    if (mode == RADIO_MODE_LORA) {
+        LoRaConfig(LORA_SF, LORA_BW, LORA_CR,
+                   LORA_PREAMBLE, LORA_PAYLOAD_LEN, LORA_CRC_ON, LORA_INVERT_IRQ);
+    } else {
+        GFSKConfig(GFSK_BITRATE_BPS, GFSK_FREQ_DEV_HZ, GFSK_RX_BW,
+                   GFSK_PREAMBLE_BITS, GFSK_SYNC_WORD_BITS,
+                   GFSK_FIXED_PAYLOAD_LEN, false);
+    }
+    s_radio_mode = mode;
+    if (lora_tx_lock) {
+        xSemaphoreGive(lora_tx_lock);
+    }
+    ESP_LOGI(TAG, "Gateway radio modem active: %s", radio_mode_name(mode));
 }
 
 static bool preview_present(const char *value)
@@ -322,6 +494,23 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
         return;
     }
 
+    if (should_drop_uart_uplink(cleaned)) {
+        s_noisy_uplink_suppressed++;
+        TickType_t now = xTaskGetTickCount();
+        if (s_last_noisy_uplink_log_tick == 0 ||
+            (now - s_last_noisy_uplink_log_tick) >= pdMS_TO_TICKS(2000)) {
+            ESP_LOGI(TAG, "Suppressed noisy UART uplink lines=%lu (latest reason=%s)",
+                     (unsigned long)s_noisy_uplink_suppressed,
+                     reason ? reason : "n/a");
+            s_last_noisy_uplink_log_tick = now;
+        }
+        return;
+    }
+
+    if (should_rate_limit_low_priority_uplink(cleaned)) {
+        return;
+    }
+
     if (!use_stream_frame && clean_len <= LORA_MAX_PAYLOAD) {
         ESP_LOGI(TAG, "UART %s direct (%u bytes%s)",
                  reason, (unsigned)clean_len, had_nonprintable ? ", sanitized" : "");
@@ -350,6 +539,94 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
     }
 }
 
+static bool looks_like_complete_json_document(const char *payload, size_t len)
+{
+    if (!payload || len == 0) {
+        return false;
+    }
+
+    size_t start = 0;
+    while (start < len) {
+        char c = payload[start];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            start++;
+        } else {
+            break;
+        }
+    }
+    while (len > start) {
+        char c = payload[len - 1];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            len--;
+        } else {
+            break;
+        }
+    }
+    if ((len - start) < 2) {
+        return false;
+    }
+
+    if (!((payload[start] == '{' && payload[len - 1] == '}') || (payload[start] == '[' && payload[len - 1] == ']'))) {
+        return false;
+    }
+
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = start; i < len; i++) {
+        char c = payload[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '{') brace_depth++;
+        else if (c == '}') brace_depth--;
+        else if (c == '[') bracket_depth++;
+        else if (c == ']') bracket_depth--;
+        if (brace_depth < 0 || bracket_depth < 0) {
+            return false;
+        }
+    }
+
+    return !in_string && brace_depth == 0 && bracket_depth == 0;
+}
+
+static bool should_stream_idle_flush_fragment(const char *payload, int len)
+{
+    if (!payload || len <= 0) {
+        return false;
+    }
+
+    int start = 0;
+    while (start < len) {
+        char c = payload[start];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            start++;
+        } else {
+            break;
+        }
+    }
+    if (start >= len) {
+        return false;
+    }
+
+    if (payload[start] == '{' || payload[start] == '[') {
+        return !looks_like_complete_json_document(payload, (size_t)len);
+    }
+
+    return false;
+}
 static stream_frame_t parse_stream_frame(char *text)
 {
     stream_frame_t out = {
@@ -419,12 +696,10 @@ static void lora_setup(void) {
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    LoRaConfig(LORA_SF, LORA_BW, LORA_CR,
-               LORA_PREAMBLE, LORA_PAYLOAD_LEN, LORA_CRC_ON, LORA_INVERT_IRQ);
-
+    gateway_apply_radio_mode(RADIO_MODE_LORA);
     set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "SETUP");
     set_status_text(s_lora_status, sizeof(s_lora_status), "READY");
-    ESP_LOGI(TAG, "LoRa ready @ %d Hz", (int)LORA_FREQ_HZ);
+    ESP_LOGI(TAG, "LoRa/GFSK radio ready @ %d Hz", (int)LORA_FREQ_HZ);
 }
 
 static void uart_setup(void) {
@@ -439,10 +714,13 @@ static void uart_setup(void) {
         .source_clk = UART_SCLK_DEFAULT
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, 0, UART_EVENT_QUEUE_LEN, &s_uart_event_queue, 0));
+    ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, UART_EVENT_QUEUE_LEN, &s_uart_event_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(GW_UART, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_rx_full_threshold(GW_UART, 128));
+    ESP_ERROR_CHECK(uart_set_rx_timeout(GW_UART, 20));
+    uart_set_always_rx_timeout(GW_UART, true);
 
     ESP_ERROR_CHECK(gpio_pullup_en(GW_UART_RX_GPIO));
     ESP_ERROR_CHECK(gpio_pulldown_dis(GW_UART_RX_GPIO));
@@ -457,27 +735,44 @@ static void lora_send_text_blocking(const char *text) {
     size_t n = strnlen(text, UART_LINE_MAX - 1);
     if (n == 0) return;
 
-    if (n > LORA_MAX_PAYLOAD) {
-        ESP_LOGW(TAG, "LoRa payload too long (%u), truncating to %u", (unsigned)n, (unsigned)LORA_MAX_PAYLOAD);
-        n = LORA_MAX_PAYLOAD;
+    size_t payload_limit = radio_payload_limit();
+    if (n > payload_limit) {
+        ESP_LOGW(TAG, "Radio payload too long for %s (%u), truncating to %u",
+                 radio_mode_name(s_radio_mode), (unsigned)n, (unsigned)payload_limit);
+        n = payload_limit;
     }
 
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
     bool sent = false;
     for (int retry = 0; retry < LORA_TX_RETRY_COUNT; retry++) {
-        int send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
-        if (send_result == 0) {
+        bool send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
+        if (send_result) {
             sent = true;
             break;
-}
+        }
         ESP_LOGW(TAG, "LoRa uplink retry %d/%d failed", retry + 1, LORA_TX_RETRY_COUNT);
         vTaskDelay(pdMS_TO_TICKS(LORA_TX_RETRY_DELAY_MS));
     }
     xSemaphoreGive(lora_tx_lock);
 
     if (!sent) {
-        ESP_LOGE(TAG, "LoRa uplink failed after %d attempts", LORA_TX_RETRY_COUNT);
+        char preview[48];
+        make_printable(text, n, preview, sizeof(preview));
+        ESP_LOGE(TAG, "LoRa uplink failed after %d attempts (%u bytes): %s",
+                 LORA_TX_RETRY_COUNT, (unsigned)n, preview);
     }
+}
+
+static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size)
+{
+    if (!rx || rx_size == 0) {
+        return 0;
+    }
+
+    xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
+    uint8_t count = LoRaReceive(rx, (int16_t)(rx_size - 1));
+    xSemaphoreGive(lora_tx_lock);
+    return count;
 }
 
 // Send a LoRa packet safely from any task without stalling producers.
@@ -507,6 +802,7 @@ static void lora_tx_task(void *arg) {
     while (1) {
         if (xQueueReceive(s_lora_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
             lora_send_text_blocking(item.payload);
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 }
@@ -518,9 +814,10 @@ static void lora_rx_task(void *arg) {
     (void)arg;
     uint8_t rx[255];
     char rx_log[255];
+    TickType_t last_motion_log_tick = 0;
 
     while (1) {
-        uint8_t n = LoRaReceive(rx, sizeof(rx));
+        uint8_t n = lora_receive_locked(rx, sizeof(rx));
         if (n > 0) {
             // Ensure it's printable as a C string
             if (n >= sizeof(rx)) n = sizeof(rx) - 1;
@@ -529,7 +826,16 @@ static void lora_rx_task(void *arg) {
             update_preview_text(rx_log, s_last_downlink, sizeof(s_last_downlink));
             s_lora_rx_count++;
             note_lora_activity();
-            ESP_LOGI(TAG, "LoRa RX (%d): %s", n, rx_log);
+            const TickType_t now = xTaskGetTickCount();
+            const bool motion_command = is_manual_downlink_command(rx_log);
+            const bool should_log_motion = !motion_command ||
+                (now - last_motion_log_tick) >= pdMS_TO_TICKS(GATEWAY_MOTION_LOG_THROTTLE_MS);
+            if (should_log_motion) {
+                ESP_LOGI(TAG, "LoRa RX (%d): %s", n, rx_log);
+                if (motion_command) {
+                    last_motion_log_tick = now;
+                }
+            }
 
             // Forward to STM32 as a line-based command
             char line[UART_LINE_MAX];
@@ -537,6 +843,17 @@ static void lora_rx_task(void *arg) {
             strncpy(rx_copy, (char*)rx, sizeof(rx_copy) - 1);
             rx_copy[sizeof(rx_copy) - 1] = '\0';
             char *cmd = trim_inplace(rx_copy);
+            radio_mode_t requested_mode = RADIO_MODE_LORA;
+
+            if (is_manual_downlink_command(cmd)) {
+                s_last_manual_downlink_tick = xTaskGetTickCount();
+            }
+
+            if (is_radio_switch_frame(cmd, &requested_mode)) {
+                ESP_LOGI(TAG, "Radio switch frame received: %s", radio_mode_name(requested_mode));
+                gateway_apply_radio_mode(requested_mode);
+                continue;
+            }
 
             stream_frame_t frame = parse_stream_frame(cmd);
             const char *uart_payload = frame.payload ? frame.payload : "";
@@ -568,9 +885,6 @@ static void lora_rx_task(void *arg) {
                 rx_seq_expected = frame.seq + 1;
 
                 if (!frame.has_end) {
-                    char ack[80];
-                    snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
-                    lora_send_text(ack);
                     continue;
                 }
 
@@ -578,7 +892,9 @@ static void lora_rx_task(void *arg) {
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
                     note_uart_activity();
-                    ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                    if (should_log_motion) {
+                        ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                    }
                 }
                 rx_stream_len = 0;
                 rx_stream_buf[0] = '\0';
@@ -588,19 +904,23 @@ static void lora_rx_task(void *arg) {
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
                     note_uart_activity();
-                    ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                    if (should_log_motion) {
+                        ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
+                    }
                 }
             }
 
             // Send a gateway receipt marker back over LoRa without pretending the
             // STM32 already applied the command. The real `ACK:` should come from
             // the STM32 response that is bridged back on UART RX.
-            char ack[80];
-            snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
-            lora_send_text(ack);
+            if (s_radio_mode != RADIO_MODE_GFSK) {
+                char ack[80];
+                snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
+                lora_send_text(ack);
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
     }
 }
 
@@ -620,8 +940,18 @@ static void gateway_heartbeat_task(void *arg) {
 
 static void gateway_display_task(void *arg) {
     (void)arg;
+    TickType_t next_display_init_retry = 0;
 
     while (1) {
+        if (!display_available) {
+            TickType_t now = xTaskGetTickCount();
+            if (now >= next_display_init_retry) {
+                ESP_LOGW(TAG, "Display unavailable, retrying OLED init");
+                display_available = display_init();
+                next_display_init_retry = now + pdMS_TO_TICKS(5000);
+            }
+        }
+
         if (display_available) {
             refresh_gateway_display_states();
             display_show_gateway_status(
@@ -652,26 +982,42 @@ static void uart_rx_task(void *arg) {
         : LORA_STREAM_CHUNK_MAX;
     TickType_t last_byte_tick = 0;
 
-    while (1) {
+    for (;;) {
+        bool saw_uart_data = false;
         if (s_uart_event_queue) {
             uart_event_t event;
-            while (xQueueReceive(s_uart_event_queue, &event, 0) == pdTRUE) {
-                if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
-                    s_uart_overflow_count++;
-                    ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input",
-                             (int)event.type, (unsigned long)s_uart_overflow_count);
-                    uart_flush_input(GW_UART);
-                    xQueueReset(s_uart_event_queue);
-                } else if (event.type == UART_PARITY_ERR || event.type == UART_FRAME_ERR) {
-                    ESP_LOGW(TAG, "UART line error type=%d", (int)event.type);
+            if (xQueueReceive(s_uart_event_queue, &event, pdMS_TO_TICKS(UART_READ_TIMEOUT_MS)) == pdTRUE) {
+                switch (event.type) {
+                    case UART_DATA:
+                        saw_uart_data = true;
+                        break;
+                    case UART_FIFO_OVF:
+                    case UART_BUFFER_FULL:
+                        s_uart_overflow_count++;
+                        ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input",
+                                 (int)event.type, (unsigned long)s_uart_overflow_count);
+                        uart_flush_input(GW_UART);
+                        xQueueReset(s_uart_event_queue);
+                        break;
+                    case UART_PARITY_ERR:
+                    case UART_FRAME_ERR:
+                        ESP_LOGW(TAG, "UART line error type=%d", (int)event.type);
+                        break;
+                    default:
+                        break;
                 }
             }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(UART_READ_TIMEOUT_MS));
         }
 
-        int r = uart_read_bytes(GW_UART, s_uart_rx_buf, sizeof(s_uart_rx_buf), pdMS_TO_TICKS(UART_READ_TIMEOUT_MS));
-        if (r > 0) {
+        // Strict event-driven read: only touch UART RX when UART_DATA was signaled.
+        if (saw_uart_data) {
+            int r = uart_read_bytes(GW_UART, s_uart_rx_buf, UART_RX_MAX_BYTES_PER_PASS, pdMS_TO_TICKS(1));
+            if (r > 0) {
+            // Process data from event
             for (int i = 0; i < r; i++) {
-            char c = (char)s_uart_rx_buf[i];
+                char c = (char)s_uart_rx_buf[i];
 
                 // Build stream/chunks; newline flushes the current chunk.
                 if (c == '\r' || c == '\0') continue;
@@ -699,6 +1045,7 @@ static void uart_rx_task(void *arg) {
                     }
                 }
             }
+            }
         }
 
         if (line_len > 0 && last_byte_tick != 0) {
@@ -709,13 +1056,23 @@ static void uart_rx_task(void *arg) {
                     : UART_STREAM_IDLE_FLUSH_MS);
 
             if ((now - last_byte_tick) >= idle_flush_ticks) {
-                forward_uart_payload_to_lora(line, line_len, line_chunked, true,
-                                             &stream_seq, "idle flush");
+                const bool incomplete_json = should_stream_idle_flush_fragment(line, line_len);
+                if (incomplete_json && line_len < (chunk_max - 8)) {
+                    // Keep accumulating incomplete JSON instead of splitting early.
+                    vTaskDelay(pdMS_TO_TICKS(UART_RX_LOOP_PAUSE_MS));
+                    continue;
+                }
+                forward_uart_payload_to_lora(line, line_len, line_chunked || incomplete_json,
+                                             incomplete_json ? false : true,
+                                             &stream_seq,
+                                             incomplete_json ? "idle flush partial json" : "idle flush");
                 line_len = 0;
-                line_chunked = false;
+                line_chunked = incomplete_json;
                 last_byte_tick = 0;
             }
         }
+
+        vTaskDelay(pdMS_TO_TICKS(UART_RX_LOOP_PAUSE_MS));
     }
 }
 
@@ -733,14 +1090,15 @@ void app_main(void) {
     lora_setup();
     display_available = display_init();
 
-    xTaskCreate(lora_tx_task, "lora_tx", TASK_STACK_LORA_TX, NULL, 6, NULL);
-    xTaskCreate(lora_rx_task, "lora_rx", TASK_STACK_LORA_RX, NULL, 5, NULL);
-    xTaskCreate(uart_rx_task, "uart_rx", TASK_STACK_UART_RX, NULL, 5, NULL);
-    xTaskCreate(gateway_heartbeat_task, "gw_heartbeat", TASK_STACK_HEARTBEAT, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(lora_tx_task, "lora_tx", TASK_STACK_LORA_TX, NULL, TASK_PRIO_LORA_TX, NULL, GATEWAY_APP_CORE);
+    xTaskCreatePinnedToCore(lora_rx_task, "lora_rx", TASK_STACK_LORA_RX, NULL, TASK_PRIO_LORA_RX, NULL, GATEWAY_APP_CORE);
+    xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", TASK_STACK_UART_RX, NULL, TASK_PRIO_UART_RX, NULL, UART_RX_TASK_CORE);
+    // Heartbeat traffic is intentionally disabled by default to keep airtime available for real control/telemetry.
     if (display_available) {
-        xTaskCreate(gateway_display_task, "gw_display", TASK_STACK_DISPLAY, NULL, 2, NULL);
+        xTaskCreatePinnedToCore(gateway_display_task, "gw_display", TASK_STACK_DISPLAY, NULL, TASK_PRIO_DISPLAY, NULL, GATEWAY_APP_CORE);
     }
 
     set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
-    ESP_LOGI(TAG, "Robot gateway running: LoRa <-> UART bridge active");
+    ESP_LOGI(TAG, "Robot gateway running: single-radio bridge active (%s default)", radio_mode_name(s_radio_mode));
 }
+

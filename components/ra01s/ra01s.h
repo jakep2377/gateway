@@ -375,9 +375,11 @@
 void     LoRaInit(void);
 int16_t  LoRaBegin(uint32_t frequencyInHz, int8_t txPowerInDbm, float tcxoVoltage, bool useRegulatorLDO);
 void     LoRaConfig(uint8_t spreadingFactor, uint8_t bandwidth, uint8_t codingRate, uint16_t preambleLength, uint8_t payloadLen, bool crcOn, bool invertIrq);
+void     GFSKConfig(uint32_t bitRate, uint32_t freqDeviation, uint8_t rxBandwidth, uint16_t preambleLengthBits, uint8_t syncWordLengthBits, uint8_t fixedPayloadLen, bool whiteningOn);
 uint8_t  LoRaReceive(uint8_t *pData, int16_t len);
 bool     LoRaSend(uint8_t *pData, int16_t len, uint8_t mode);
 void     LoRaDebugPrint(bool enable);
+uint8_t  RadioGetPacketType(void);
 
 // Private function
 void     spi_write_byte(uint8_t* Dataout, size_t DataLength );
