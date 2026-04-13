@@ -251,7 +251,12 @@ static bool is_manual_downlink_command(const char *payload)
     if (!payload || payload[0] == '\0') {
         return false;
     }
-    return strncmp(payload, "D:", 2) == 0 ||
+    return strcmp(payload, "MANUAL") == 0 ||
+           strcmp(payload, "M") == 0 ||
+           strcmp(payload, "CMD:M") == 0 ||
+           strcmp(payload, "CMD:MANUAL") == 0 ||
+           strncmp(payload, "D:", 2) == 0 ||
+           strncmp(payload, "J:", 2) == 0 ||
            strncmp(payload, "DRIVE,", 6) == 0 ||
            strcmp(payload, "FORWARD") == 0 ||
            strcmp(payload, "BACKWARD") == 0 ||
