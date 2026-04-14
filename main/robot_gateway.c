@@ -429,6 +429,16 @@ static void set_status_text(char *target, size_t target_size, const char *value)
     snprintf(target, target_size, "%s", value ? value : "none");
 }
 
+static bool matches_any_token(const char *value, const char *const *tokens, size_t token_count) {
+    if (!value || !tokens || token_count == 0) return false;
+    for (size_t i = 0; i < token_count; i++) {
+        if (tokens[i] && strcmp(value, tokens[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_high_priority_manual_uplink(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
     if (strncmp(payload, "ACK:", 4) == 0) return true;
@@ -436,11 +446,13 @@ static bool is_high_priority_manual_uplink(const char *payload) {
 }
 
 static bool is_manual_downlink_command(const char *payload) {
+    static const char *const manual_tokens[] = {
+        "MANUAL", "PAUSE", "AUTO", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP", "ESTOP",
+    };
+
     if (!payload || payload[0] == '\0') return false;
     if (strncmp(payload, "D:", 2) == 0 || strncmp(payload, "J:", 2) == 0 || strncmp(payload, "DRIVE,", 6) == 0) return true;
-    return strcmp(payload, "MANUAL") == 0 || strcmp(payload, "PAUSE") == 0 || strcmp(payload, "AUTO") == 0 ||
-           strcmp(payload, "FORWARD") == 0 || strcmp(payload, "BACKWARD") == 0 || strcmp(payload, "LEFT") == 0 ||
-           strcmp(payload, "RIGHT") == 0 || strcmp(payload, "STOP") == 0 || strcmp(payload, "ESTOP") == 0;
+    return matches_any_token(payload, manual_tokens, sizeof(manual_tokens) / sizeof(manual_tokens[0]));
 }
 
 static bool should_suppress_uplink_in_manual_mode(const char *payload) {
