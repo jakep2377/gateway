@@ -220,17 +220,23 @@ bool display_init(void) {
 
 void display_show_gateway_status(const char *mode,
                                  const char *lora_status,
+                                 const char *cmd_status,
                                  const char *uart_status,
                                  const char *last_downlink,
                                  const char *last_uplink,
+                                 const char *alert_headline,
+                                 const char *alert_detail,
                                  uint32_t lora_rx_count,
-                                 uint32_t uart_forward_count) {
+                                 uint32_t uart_forward_count,
+                                 uint32_t tx_drop_count,
+                                 uint32_t uart_overflow_count) {
     static char cache[8][OLED_TEXT_LINE_LEN + 1] = {{0}};
     static int last_page = -1;
     char line[OLED_TEXT_LINE_LEN + 1];
     char detail[OLED_TEXT_LINE_LEN + 1];
     char mode_label[12];
     char lora_label[12];
+    char cmd_label[12];
     char uart_label[12];
     char downlink_label[14];
     char uplink_label[14];
@@ -239,11 +245,15 @@ void display_show_gateway_status(const char *mode,
 
     compact_state_label(mode, mode_label, sizeof(mode_label));
     compact_state_label(lora_status, lora_label, sizeof(lora_label));
+    compact_state_label(cmd_status, cmd_label, sizeof(cmd_label));
     compact_state_label(uart_status, uart_label, sizeof(uart_label));
     compact_token_label(last_downlink, downlink_label, sizeof(downlink_label));
     compact_token_label(last_uplink, uplink_label, sizeof(uplink_label));
 
-    bool show_alert = state_needs_alert(lora_label) || state_needs_alert(uart_label);
+    bool show_alert = state_needs_alert(lora_label)
+        || state_needs_alert(uart_label)
+        || tx_drop_count > 0
+        || uart_overflow_count > 0;
     int page_count = show_alert ? 3 : 2;
     int page = (int)((now / pdMS_TO_TICKS(OLED_PAGE_SWITCH_MS)) % page_count);
 
@@ -254,63 +264,72 @@ void display_show_gateway_status(const char *mode,
     }
 
     if (page == 0) {
-        write_line(0, "GATEWAY P1", cache[0], sizeof(cache[0]));
+        write_line(0, "GW STATUS P1", cache[0], sizeof(cache[0]));
 
         snprintf(line, sizeof(line), "MODE:%-.10s", mode_label);
         write_line(1, line, cache[1], sizeof(cache[1]));
 
-        snprintf(line, sizeof(line), "L:%-.4s U:%-.4s", lora_label, uart_label);
+        snprintf(line, sizeof(line), "L:%-.4s C:%-.4s", lora_label, cmd_label);
         write_line(2, line, cache[2], sizeof(cache[2]));
 
-        write_line(3, "BASE->ROBOT", cache[3], sizeof(cache[3]));
+        snprintf(line, sizeof(line), "UART:%-.8s", uart_label);
+        write_line(3, line, cache[3], sizeof(cache[3]));
+
+        write_line(4, "BASE->ROBOT", cache[4], sizeof(cache[4]));
         copy_windowed_text(last_downlink, detail, sizeof(detail), scroll_step);
-        write_line(4, detail, cache[4], sizeof(cache[4]));
+        write_line(5, detail, cache[5], sizeof(cache[5]));
 
-        write_line(5, "ROBOT->BASE", cache[5], sizeof(cache[5]));
+        write_line(6, "ROBOT->BASE", cache[6], sizeof(cache[6]));
         copy_windowed_text(last_uplink, detail, sizeof(detail), scroll_step + 5);
-        write_line(6, detail, cache[6], sizeof(cache[6]));
-
-        snprintf(line, sizeof(line), "RX:%02lu TX:%02lu",
-                 (unsigned long)(lora_rx_count % 100),
-                 (unsigned long)(uart_forward_count % 100));
-        write_line(7, line, cache[7], sizeof(cache[7]));
+        write_line(7, detail, cache[7], sizeof(cache[7]));
     } else if (page == 1) {
         write_line(0, "GW DETAIL P2", cache[0], sizeof(cache[0]));
 
-        write_line(1, "DOWNLINK", cache[1], sizeof(cache[1]));
-        copy_windowed_text(last_downlink, detail, sizeof(detail), scroll_step + 9);
-        write_line(2, detail, cache[2], sizeof(cache[2]));
+        snprintf(line, sizeof(line), "RX:%02lu TX:%02lu",
+                 (unsigned long)(lora_rx_count % 100),
+                 (unsigned long)(uart_forward_count % 100));
+        write_line(1, line, cache[1], sizeof(cache[1]));
 
-        write_line(3, "UPLINK", cache[3], sizeof(cache[3]));
-        copy_windowed_text(last_uplink, detail, sizeof(detail), scroll_step + 13);
+        snprintf(line, sizeof(line), "DROP:%02lu OF:%02lu",
+                 (unsigned long)(tx_drop_count % 100),
+                 (unsigned long)(uart_overflow_count % 100));
+        write_line(2, line, cache[2], sizeof(cache[2]));
+
+        write_line(3, "DOWNLINK", cache[3], sizeof(cache[3]));
+        copy_windowed_text(last_downlink, detail, sizeof(detail), scroll_step + 9);
         write_line(4, detail, cache[4], sizeof(cache[4]));
 
-        write_line(5, "SHORT STATUS", cache[5], sizeof(cache[5]));
-        snprintf(line, sizeof(line), "M:%.4s L:%.4s", mode_label, lora_label);
-        write_line(6, line, cache[6], sizeof(cache[6]));
-        snprintf(line, sizeof(line), "UART:%.8s", uart_label);
+        write_line(5, "UPLINK", cache[5], sizeof(cache[5]));
+        copy_windowed_text(last_uplink, detail, sizeof(detail), scroll_step + 13);
+        write_line(6, detail, cache[6], sizeof(cache[6]));
+        snprintf(line, sizeof(line), "M:%.4s C:%.4s", mode_label, cmd_label);
         write_line(7, line, cache[7], sizeof(cache[7]));
     } else {
-        write_line_ex(0, "!!! ALERT !!!", cache[0], sizeof(cache[0]), true);
+        write_line_ex(0, "!!! GW ALERT !", cache[0], sizeof(cache[0]), true);
+
+        copy_windowed_text(alert_headline, detail, sizeof(detail), scroll_step);
+        write_line_ex(1, detail, cache[1], sizeof(cache[1]), true);
 
         snprintf(line, sizeof(line), "LORA:%-.10s", lora_label);
-        write_line_ex(1, line, cache[1], sizeof(cache[1]), true);
+        write_line_ex(2, line, cache[2], sizeof(cache[2]), true);
+
+        snprintf(line, sizeof(line), "CMD:%-.11s", cmd_label);
+        write_line_ex(3, line, cache[3], sizeof(cache[3]), true);
 
         snprintf(line, sizeof(line), "UART:%-.10s", uart_label);
-        write_line_ex(2, line, cache[2], sizeof(cache[2]), true);
+        write_line_ex(4, line, cache[4], sizeof(cache[4]), true);
+
+        copy_windowed_text(alert_detail, detail, sizeof(detail), scroll_step + 3);
+        write_line_ex(5, detail, cache[5], sizeof(cache[5]), true);
+
+        snprintf(line, sizeof(line), "D:%02lu O:%02lu",
+                 (unsigned long)(tx_drop_count % 100),
+                 (unsigned long)(uart_overflow_count % 100));
+        write_line_ex(6, line, cache[6], sizeof(cache[6]), true);
 
         snprintf(line, sizeof(line), "RX:%02lu TX:%02lu",
                  (unsigned long)(lora_rx_count % 100),
                  (unsigned long)(uart_forward_count % 100));
-        write_line_ex(3, line, cache[3], sizeof(cache[3]), true);
-
-        snprintf(line, sizeof(line), "DOWN:%-.11s", downlink_label);
-        write_line_ex(4, line, cache[4], sizeof(cache[4]), true);
-
-        snprintf(line, sizeof(line), "UP:%-.13s", uplink_label);
-        write_line_ex(5, line, cache[5], sizeof(cache[5]), true);
-
-        write_line_ex(6, "CHECK LINKS", cache[6], sizeof(cache[6]), true);
-        write_line_ex(7, "AND POWER", cache[7], sizeof(cache[7]), true);
+        write_line_ex(7, line, cache[7], sizeof(cache[7]), true);
     }
 }

@@ -97,7 +97,10 @@ static uint32_t s_lora_rx_count = 0;
 static uint32_t s_uart_forward_count = 0;
 static char s_gateway_mode[16] = "BOOT";
 static char s_lora_status[16] = "IDLE";
+static char s_cmd_status[16] = "IDLE";
 static char s_uart_status[16] = "IDLE";
+static char s_alert_headline[32] = "BRIDGE OK";
+static char s_alert_detail[48] = "Waiting for traffic";
 static TickType_t s_last_lora_activity_tick = 0;
 static TickType_t s_last_uart_activity_tick = 0;
 static httpd_handle_t s_http_server = NULL;
@@ -123,6 +126,7 @@ static QueueHandle_t s_lora_tx_queue = NULL;
 static QueueHandle_t s_uart_event_queue = NULL;
 static uint32_t s_lora_tx_queue_drops = 0;
 static uint32_t s_uart_overflow_count = 0;
+static uint32_t s_lora_tx_fail_count = 0;
 static uint32_t s_noisy_uplink_suppressed = 0;
 static TickType_t s_last_noisy_uplink_log_tick = 0;
 static TickType_t s_last_low_priority_uplink_tick = 0;
@@ -487,6 +491,9 @@ static void lora_send_text_blocking(const char *text) {
     }
     xSemaphoreGive(lora_tx_lock);
     if (!sent) {
+        s_lora_tx_fail_count++;
+        s_last_lora_tx_fail_tick = xTaskGetTickCount();
+        set_cmd_status("FAILED");
         char preview[48];
         make_printable(text, n, preview, sizeof(preview));
         ESP_LOGE(TAG, "LoRa uplink failed after %d attempts (%u bytes): %s", LORA_TX_RETRY_COUNT, (unsigned)n, preview);
