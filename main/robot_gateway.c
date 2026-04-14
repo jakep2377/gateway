@@ -94,9 +94,16 @@ static uint32_t s_lora_rx_count = 0;
 static uint32_t s_uart_forward_count = 0;
 static char s_gateway_mode[16] = "BOOT";
 static char s_lora_status[16] = "IDLE";
+static char s_cmd_status[16] = "IDLE";
 static char s_uart_status[16] = "IDLE";
+static char s_alert_headline[32] = "BRIDGE OK";
+static char s_alert_detail[48] = "Waiting for traffic";
 static TickType_t s_last_lora_activity_tick = 0;
 static TickType_t s_last_uart_activity_tick = 0;
+static TickType_t s_last_lora_tx_fail_tick = 0;
+static TickType_t s_last_uart_overflow_tick = 0;
+static TickType_t s_last_queue_drop_tick = 0;
+static TickType_t s_last_cmd_status_tick = 0;
 
 typedef enum {
     RADIO_MODE_LORA = 0,
@@ -120,6 +127,7 @@ static QueueHandle_t s_lora_tx_queue = NULL;
 static QueueHandle_t s_uart_event_queue = NULL;
 static uint32_t s_lora_tx_queue_drops = 0;
 static uint32_t s_uart_overflow_count = 0;
+static uint32_t s_lora_tx_fail_count = 0;
 static uint32_t s_noisy_uplink_suppressed = 0;
 static TickType_t s_last_noisy_uplink_log_tick = 0;
 static TickType_t s_last_low_priority_uplink_tick = 0;
@@ -201,6 +209,12 @@ static void set_status_text(char *target, size_t target_size, const char *value)
 {
     if (!target || target_size == 0) return;
     snprintf(target, target_size, "%s", value ? value : "none");
+}
+
+static void set_cmd_status(const char *value)
+{
+    set_status_text(s_cmd_status, sizeof(s_cmd_status), value ? value : "IDLE");
+    s_last_cmd_status_tick = xTaskGetTickCount();
 }
 
 static const char *radio_mode_name(radio_mode_t mode)
@@ -400,6 +414,37 @@ static void refresh_gateway_display_states(void)
     } else {
         set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "SETUP");
     }
+
+    if (s_last_cmd_status_tick != 0 && (now - s_last_cmd_status_tick) > pdMS_TO_TICKS(15000)) {
+        set_status_text(s_cmd_status, sizeof(s_cmd_status), "IDLE");
+        s_last_cmd_status_tick = 0;
+    }
+
+    if (s_last_uart_overflow_tick != 0 && (now - s_last_uart_overflow_tick) < pdMS_TO_TICKS(30000)) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "UART OVERFLOW");
+        snprintf(s_alert_detail, sizeof(s_alert_detail), "Input flushed %lu time(s)", (unsigned long)s_uart_overflow_count);
+    } else if (s_last_queue_drop_tick != 0 && (now - s_last_queue_drop_tick) < pdMS_TO_TICKS(30000)) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "LORA BACKLOG");
+        snprintf(s_alert_detail, sizeof(s_alert_detail), "TX queue dropped %lu packet(s)", (unsigned long)s_lora_tx_queue_drops);
+    } else if (s_last_lora_tx_fail_tick != 0 && (now - s_last_lora_tx_fail_tick) < pdMS_TO_TICKS(30000)) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "UPLINK FAILED");
+        snprintf(s_alert_detail, sizeof(s_alert_detail), "LoRa TX failed %lu time(s)", (unsigned long)s_lora_tx_fail_count);
+    } else if (strcmp(s_lora_status, "WARN") == 0 && strcmp(s_uart_status, "WARN") == 0) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "LINKS LOST");
+        set_status_text(s_alert_detail, sizeof(s_alert_detail), "No LoRa or UART traffic");
+    } else if (strcmp(s_lora_status, "WARN") == 0) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "LORA SILENT");
+        set_status_text(s_alert_detail, sizeof(s_alert_detail), "No recent radio traffic");
+    } else if (strcmp(s_uart_status, "WARN") == 0) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "ROBOT SILENT");
+        set_status_text(s_alert_detail, sizeof(s_alert_detail), "No recent UART traffic");
+    } else if (strcmp(s_lora_status, "STALE") == 0 || strcmp(s_uart_status, "IDLE") == 0) {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "RECOVERING");
+        set_status_text(s_alert_detail, sizeof(s_alert_detail), "Waiting for fresh traffic");
+    } else {
+        set_status_text(s_alert_headline, sizeof(s_alert_headline), "BRIDGE OK");
+        set_status_text(s_alert_detail, sizeof(s_alert_detail), "Traffic is flowing");
+    }
 }
 
 static size_t sanitize_uart_payload(const char *in, size_t in_len, char *out, size_t out_size, bool *had_nonprintable)
@@ -514,6 +559,16 @@ static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_
 
     if (should_rate_limit_low_priority_uplink(cleaned)) {
         return;
+    }
+
+    if (strncmp(cleaned, "ACK:", 4) == 0) {
+        set_cmd_status("ACK");
+    } else if (strncmp(cleaned, "STATUS:ERROR", 12) == 0) {
+        set_cmd_status("ERR");
+    } else if (strncmp(cleaned, "STATUS:OK", 9) == 0) {
+        set_cmd_status("APPLIED");
+    } else if (strncmp(cleaned, "FLOW:", 5) == 0) {
+        set_cmd_status("TELEM");
     }
 
     if (!use_stream_frame && clean_len <= LORA_MAX_PAYLOAD) {
@@ -752,6 +807,7 @@ static void lora_send_text_blocking(const char *text) {
     for (int retry = 0; retry < LORA_TX_RETRY_COUNT; retry++) {
         bool send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
         if (send_result) {
+            set_cmd_status("SENT");
             sent = true;
             break;
         }
@@ -761,6 +817,9 @@ static void lora_send_text_blocking(const char *text) {
     xSemaphoreGive(lora_tx_lock);
 
     if (!sent) {
+        s_lora_tx_fail_count++;
+        s_last_lora_tx_fail_tick = xTaskGetTickCount();
+        set_cmd_status("FAILED");
         char preview[48];
         make_printable(text, n, preview, sizeof(preview));
         ESP_LOGE(TAG, "LoRa uplink failed after %d attempts (%u bytes): %s",
@@ -794,6 +853,8 @@ static void lora_send_text(const char *text) {
 
     if (xQueueSend(s_lora_tx_queue, &item, pdMS_TO_TICKS(LORA_TX_QUEUE_WAIT_MS)) != pdTRUE) {
         s_lora_tx_queue_drops++;
+        s_last_queue_drop_tick = xTaskGetTickCount();
+        set_cmd_status("BACKLOG");
         if ((s_lora_tx_queue_drops % 10U) == 1U) {
             ESP_LOGW(TAG, "LoRa TX queue full, dropped=%lu", (unsigned long)s_lora_tx_queue_drops);
         }
@@ -896,6 +957,7 @@ static void lora_rx_task(void *arg) {
                 int w = snprintf(line, sizeof(line), "%s\r\n", rx_stream_buf);
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
+                    set_cmd_status("FORWARDED");
                     note_uart_activity();
                     if (should_log_motion) {
                         ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
@@ -908,6 +970,7 @@ static void lora_rx_task(void *arg) {
                 int w = snprintf(line, sizeof(line), "%s\r\n", uart_payload);
                 if (w > 0) {
                     uart_write_bytes(GW_UART, line, w);
+                    set_cmd_status("FORWARDED");
                     note_uart_activity();
                     if (should_log_motion) {
                         ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
@@ -962,11 +1025,16 @@ static void gateway_display_task(void *arg) {
             display_show_gateway_status(
                 s_gateway_mode,
                 s_lora_status,
+                s_cmd_status,
                 s_uart_status,
                 s_last_downlink,
                 s_last_uplink,
+                s_alert_headline,
+                s_alert_detail,
                 s_lora_rx_count,
-                s_uart_forward_count);
+                s_uart_forward_count,
+                s_lora_tx_queue_drops,
+                s_uart_overflow_count);
         }
         vTaskDelay(pdMS_TO_TICKS(700));
     }
@@ -999,6 +1067,8 @@ static void uart_rx_task(void *arg) {
                     case UART_FIFO_OVF:
                     case UART_BUFFER_FULL:
                         s_uart_overflow_count++;
+                        s_last_uart_overflow_tick = xTaskGetTickCount();
+                        set_cmd_status("UART");
                         ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input",
                                  (int)event.type, (unsigned long)s_uart_overflow_count);
                         uart_flush_input(GW_UART);
