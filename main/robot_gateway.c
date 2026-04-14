@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,11 +11,16 @@
 #include "freertos/queue.h"
 
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "lwip/ip4_addr.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 
 #include "ra01s.h"
-
-#include "driver/gpio.h"
 #include "display.h"
 
 // ---------------- LoRa settings ----------------
@@ -30,21 +36,20 @@
 #define LORA_PAYLOAD_LEN   0
 #define LORA_CRC_ON        true
 #define LORA_INVERT_IRQ    false
-#define GFSK_BITRATE_BPS   100000U
-#define GFSK_FREQ_DEV_HZ   50000U
-#define GFSK_RX_BW         SX126X_GFSK_RX_BW_156_2
-#define GFSK_PREAMBLE_BITS 32U
-#define GFSK_SYNC_WORD_BITS 32U
-#define GFSK_FIXED_PAYLOAD_LEN 64U
+
+// ---------------- Gateway Wi-Fi ----------------
+#define GW_STA_SSID        "SaltRobot_Base"
+#define GW_STA_PASS        "saltrobot123"
+#define GW_STA_STATIC_IP   "192.168.4.2"
+#define GW_STA_GW          "192.168.4.1"
+#define GW_STA_NETMASK     "255.255.255.0"
 
 // ---------------- UART settings ----------------
 #define GW_UART            UART_NUM_1
 #define GW_UART_BAUD       921600
-
 #define GW_UART_TX_GPIO    6
 #define GW_UART_RX_GPIO    7
 
-// UART RX buffering
 #define UART_RX_BUF_SIZE   16384
 #define UART_TX_BUF_SIZE   8192
 #define UART_LINE_MAX      1024
@@ -69,17 +74,15 @@
 #define TASK_STACK_LORA_TX 6144
 #define TASK_STACK_LORA_RX 6144
 #define TASK_STACK_UART_RX 10240
-#define TASK_STACK_HEARTBEAT 3072
 #define TASK_STACK_DISPLAY 4096
+#define TASK_STACK_WIFI_HTTP 6144
 #define GATEWAY_APP_CORE 1
 #define UART_RX_TASK_CORE tskNO_AFFINITY
 #define TASK_PRIO_LORA_TX 4
 #define TASK_PRIO_LORA_RX 3
 #define TASK_PRIO_UART_RX 1
-#define TASK_PRIO_HEARTBEAT 1
 #define TASK_PRIO_DISPLAY 1
 #define LORA_RX_POLL_DELAY_MS           5
-#define GATEWAY_HEARTBEAT_INTERVAL_MS    12000
 #define GATEWAY_ACTIVITY_READY_MS        8000
 #define GATEWAY_ACTIVITY_WARN_MS         90000
 #define LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS 30
@@ -97,11 +100,12 @@ static char s_lora_status[16] = "IDLE";
 static char s_uart_status[16] = "IDLE";
 static TickType_t s_last_lora_activity_tick = 0;
 static TickType_t s_last_uart_activity_tick = 0;
-
-typedef enum {
-    RADIO_MODE_LORA = 0,
-    RADIO_MODE_GFSK = 1,
-} radio_mode_t;
+static httpd_handle_t s_http_server = NULL;
+static esp_netif_t *s_sta_netif = NULL;
+static bool s_wifi_connected = false;
+static uint32_t s_manual_http_count = 0;
+static uint32_t s_last_manual_http_tick = 0;
+static char s_last_manual_http_cmd[32] = "none";
 
 typedef struct {
     bool is_stream;
@@ -114,7 +118,6 @@ typedef struct {
     char payload[LORA_MAX_PAYLOAD + 1];
 } lora_tx_item_t;
 
-// Simple mutex around LoRa send
 static SemaphoreHandle_t lora_tx_lock;
 static QueueHandle_t s_lora_tx_queue = NULL;
 static QueueHandle_t s_uart_event_queue = NULL;
@@ -129,17 +132,10 @@ static bool rx_seq_init = false;
 static uint32_t rx_seq_expected = 0;
 static char rx_stream_buf[UART_LINE_MAX];
 static int rx_stream_len = 0;
-static uint8_t s_uart_rx_buf[UART_RX_BUF_SIZE];
-static volatile radio_mode_t s_radio_mode = RADIO_MODE_LORA;
-
-static const char RADIO_SWITCH_TO_GFSK_FRAME[] = "RADIO:GFSK";
-static const char RADIO_SWITCH_TO_LORA_FRAME[] = "RADIO:LORA";
 
 static void lora_send_text_blocking(const char *text);
 static void lora_send_text(const char *text);
 static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size);
-
-// ---------------- Helpers ----------------
 
 static char* trim_inplace(char *s) {
     if (!s) return s;
@@ -160,530 +156,278 @@ static char* trim_inplace(char *s) {
     return s;
 }
 
-static void make_printable(const char *in, size_t in_len, char *out, size_t out_size)
-{
+static void make_printable(const char *in, size_t in_len, char *out, size_t out_size) {
     if (!out || out_size == 0) return;
-    if (!in || in_len == 0) {
-        out[0] = '\0';
-        return;
-    }
-
+    if (!in || in_len == 0) { out[0] = '\0'; return; }
     size_t j = 0;
     for (size_t i = 0; i < in_len && j + 1 < out_size; i++) {
         unsigned char c = (unsigned char)in[i];
-        if (c >= 32 && c <= 126) {
-            out[j++] = (char)c;
-        } else {
-            out[j++] = '.';
-        }
+        out[j++] = (c >= 32 && c <= 126) ? (char)c : '.';
     }
     out[j] = '\0';
 }
 
-static void update_preview_text(const char *input, char *out, size_t out_size)
-{
+static void update_preview_text(const char *input, char *out, size_t out_size) {
     if (!out || out_size == 0) return;
-    if (!input) {
-        snprintf(out, out_size, "none");
-        return;
-    }
-
+    if (!input) { snprintf(out, out_size, "none"); return; }
     char printable[64];
     make_printable(input, strnlen(input, sizeof(printable) - 1), printable, sizeof(printable));
     char *trimmed = trim_inplace(printable);
     snprintf(out, out_size, "%.*s", (int)((strlen(trimmed) < out_size - 1) ? strlen(trimmed) : out_size - 1), trimmed);
-    if (out[0] == '\0') {
-        snprintf(out, out_size, "none");
-    }
+    if (out[0] == '\0') snprintf(out, out_size, "none");
 }
 
-static void set_status_text(char *target, size_t target_size, const char *value)
-{
+static void set_status_text(char *target, size_t target_size, const char *value) {
     if (!target || target_size == 0) return;
     snprintf(target, target_size, "%s", value ? value : "none");
 }
 
-static const char *radio_mode_name(radio_mode_t mode)
-{
-    return mode == RADIO_MODE_GFSK ? "GFSK" : "LORA";
+static bool is_high_priority_manual_uplink(const char *payload) {
+    if (!payload || payload[0] == '\0') return false;
+    if (strncmp(payload, "ACK:", 4) == 0) return true;
+    return strncmp(payload, "F:", 2) == 0 || strncmp(payload, "FAULT", 5) == 0 || strstr(payload, "ESTOP") != NULL;
 }
 
-static size_t radio_payload_limit(void)
-{
-    return (s_radio_mode == RADIO_MODE_GFSK) ? GFSK_FIXED_PAYLOAD_LEN : LORA_MAX_PAYLOAD;
+static bool is_manual_downlink_command(const char *payload) {
+    if (!payload || payload[0] == '\0') return false;
+    return strcmp(payload, "MANUAL") == 0 || strcmp(payload, "PAUSE") == 0 || strcmp(payload, "AUTO") == 0 ||
+           strcmp(payload, "FORWARD") == 0 || strcmp(payload, "BACKWARD") == 0 || strcmp(payload, "LEFT") == 0 ||
+           strcmp(payload, "RIGHT") == 0 || strcmp(payload, "STOP") == 0 || strcmp(payload, "ESTOP") == 0;
 }
 
-static bool is_radio_switch_frame(const char *payload, radio_mode_t *target_mode)
-{
-    if (!payload) {
-        return false;
-    }
-    if (strcmp(payload, RADIO_SWITCH_TO_GFSK_FRAME) == 0) {
-        if (target_mode) {
-            *target_mode = RADIO_MODE_GFSK;
-        }
-        return true;
-    }
-    if (strcmp(payload, RADIO_SWITCH_TO_LORA_FRAME) == 0) {
-        if (target_mode) {
-            *target_mode = RADIO_MODE_LORA;
-        }
-        return true;
-    }
+static bool should_suppress_uplink_in_manual_mode(const char *payload) {
+    (void)payload;
     return false;
 }
 
-static bool is_high_priority_manual_uplink(const char *payload)
-{
-    if (!payload || payload[0] == '\0') {
-        return false;
-    }
-    if (strncmp(payload, "ACK:", 4) == 0) {
-        return true;
-    }
-    return strncmp(payload, "F:", 2) == 0 ||
-           strncmp(payload, "FAULT", 5) == 0 ||
-           strstr(payload, "ESTOP") != NULL;
-}
-
-static bool is_manual_downlink_command(const char *payload)
-{
-    if (!payload || payload[0] == '\0') {
-        return false;
-    }
-    return strcmp(payload, "MANUAL") == 0 ||
-           strcmp(payload, "M") == 0 ||
-           strcmp(payload, "CMD:M") == 0 ||
-           strcmp(payload, "CMD:MANUAL") == 0 ||
-           strncmp(payload, "D:", 2) == 0 ||
-           strncmp(payload, "J:", 2) == 0 ||
-           strncmp(payload, "DRIVE,", 6) == 0 ||
-           strcmp(payload, "FORWARD") == 0 ||
-           strcmp(payload, "BACKWARD") == 0 ||
-           strcmp(payload, "LEFT") == 0 ||
-           strcmp(payload, "RIGHT") == 0 ||
-           strcmp(payload, "STOP") == 0;
-}
-
-static bool should_suppress_uplink_in_manual_mode(const char *payload)
-{
-    return s_radio_mode == RADIO_MODE_GFSK && !is_high_priority_manual_uplink(payload);
-}
-
-static bool is_noisy_console_uplink(const char *payload)
-{
-    if (!payload || payload[0] == '\0') {
-        return false;
-    }
-
+static bool is_noisy_console_uplink(const char *payload) {
+    if (!payload || payload[0] == '\0') return false;
     return strstr(payload, "[HEALTH] GPS: TIMEOUT") != NULL ||
            strstr(payload, "[HEALTH] GPS: DEGRADED") != NULL ||
            strstr(payload, "[RC] Health check") != NULL ||
            strstr(payload, "[CONSOLE] USART2 RX recovered") != NULL;
 }
 
-static bool should_drop_uart_uplink(const char *payload)
-{
-    if (!payload || payload[0] == '\0') {
-        return false;
-    }
-
-    if (is_high_priority_manual_uplink(payload)) {
-        return false;
-    }
-
-    if (is_noisy_console_uplink(payload)) {
-        return true;
-    }
-
+static bool should_drop_uart_uplink(const char *payload) {
+    if (!payload || payload[0] == '\0') return false;
+    if (is_high_priority_manual_uplink(payload)) return false;
+    if (is_noisy_console_uplink(payload)) return true;
     return should_suppress_uplink_in_manual_mode(payload);
 }
 
-static bool should_rate_limit_low_priority_uplink(const char *payload)
-{
-    if (!payload || payload[0] == '\0') {
-        return false;
-    }
-
-    if (is_high_priority_manual_uplink(payload)) {
-        return false;
-    }
-
+static bool should_rate_limit_low_priority_uplink(const char *payload) {
+    if (!payload || payload[0] == '\0') return false;
+    if (is_high_priority_manual_uplink(payload)) return false;
     TickType_t now = xTaskGetTickCount();
-    if (s_last_manual_downlink_tick != 0 &&
-        (now - s_last_manual_downlink_tick) < pdMS_TO_TICKS(MANUAL_DOWNLINK_GUARD_MS)) {
-        return true;
-    }
-
-    if (s_last_low_priority_uplink_tick != 0 &&
-        (now - s_last_low_priority_uplink_tick) < pdMS_TO_TICKS(LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS)) {
-        return true;
-    }
-
+    if (s_last_manual_downlink_tick != 0 && (now - s_last_manual_downlink_tick) < pdMS_TO_TICKS(MANUAL_DOWNLINK_GUARD_MS)) return true;
+    if (s_last_low_priority_uplink_tick != 0 && (now - s_last_low_priority_uplink_tick) < pdMS_TO_TICKS(LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS)) return true;
     s_last_low_priority_uplink_tick = now;
     return false;
 }
 
-static void gateway_apply_radio_mode(radio_mode_t mode)
-{
-    if (lora_tx_lock) {
-        xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
-    }
-    if (mode == RADIO_MODE_LORA) {
-        LoRaConfig(LORA_SF, LORA_BW, LORA_CR,
-                   LORA_PREAMBLE, LORA_PAYLOAD_LEN, LORA_CRC_ON, LORA_INVERT_IRQ);
-    } else {
-        GFSKConfig(GFSK_BITRATE_BPS, GFSK_FREQ_DEV_HZ, GFSK_RX_BW,
-                   GFSK_PREAMBLE_BITS, GFSK_SYNC_WORD_BITS,
-                   GFSK_FIXED_PAYLOAD_LEN, false);
-    }
-    s_radio_mode = mode;
-    if (lora_tx_lock) {
-        xSemaphoreGive(lora_tx_lock);
-    }
-    ESP_LOGI(TAG, "Gateway radio modem active: %s", radio_mode_name(mode));
-}
-
-static bool preview_present(const char *value)
-{
+static bool preview_present(const char *value) {
     return value && value[0] != '\0' && strcmp(value, "none") != 0;
 }
 
-static void note_lora_activity(void)
-{
+static void note_lora_activity(void) {
     s_last_lora_activity_tick = xTaskGetTickCount();
     set_status_text(s_lora_status, sizeof(s_lora_status), "ONLINE");
 }
 
-static void note_uart_activity(void)
-{
+static void note_uart_activity(void) {
     s_last_uart_activity_tick = xTaskGetTickCount();
     set_status_text(s_uart_status, sizeof(s_uart_status), "BRIDGE");
 }
 
-static void refresh_gateway_display_states(void)
-{
+static void refresh_gateway_display_states(void) {
     const TickType_t now = xTaskGetTickCount();
     const bool lora_seen = (s_lora_rx_count > 0) || preview_present(s_last_downlink);
     const bool uart_seen = (s_uart_forward_count > 0) || preview_present(s_last_uplink);
-    const uint32_t lora_age_ms = s_last_lora_activity_tick == 0
-        ? UINT32_MAX
-        : (uint32_t)((now - s_last_lora_activity_tick) * portTICK_PERIOD_MS);
-    const uint32_t uart_age_ms = s_last_uart_activity_tick == 0
-        ? UINT32_MAX
-        : (uint32_t)((now - s_last_uart_activity_tick) * portTICK_PERIOD_MS);
-
-    if (!lora_seen) {
-        set_status_text(s_lora_status, sizeof(s_lora_status), "IDLE");
-    } else if (lora_age_ms <= GATEWAY_ACTIVITY_READY_MS) {
-        set_status_text(s_lora_status, sizeof(s_lora_status), "ONLINE");
-    } else if (lora_age_ms <= GATEWAY_ACTIVITY_WARN_MS) {
-        set_status_text(s_lora_status, sizeof(s_lora_status), "STALE");
-    } else {
-        set_status_text(s_lora_status, sizeof(s_lora_status), "WARN");
-    }
-
-    if (!uart_seen) {
-        set_status_text(s_uart_status, sizeof(s_uart_status), "IDLE");
-    } else if (uart_age_ms <= GATEWAY_ACTIVITY_READY_MS) {
-        set_status_text(s_uart_status, sizeof(s_uart_status), "BRIDGE");
-    } else if (uart_age_ms <= GATEWAY_ACTIVITY_WARN_MS) {
-        set_status_text(s_uart_status, sizeof(s_uart_status), "IDLE");
-    } else {
-        set_status_text(s_uart_status, sizeof(s_uart_status), "WARN");
-    }
-
-    if (strcmp(s_lora_status, "WARN") == 0 && strcmp(s_uart_status, "WARN") == 0) {
-        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WARN");
-    } else if (lora_seen || uart_seen) {
-        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
-    } else {
-        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "SETUP");
-    }
+    const uint32_t lora_age_ms = s_last_lora_activity_tick == 0 ? UINT32_MAX : (uint32_t)((now - s_last_lora_activity_tick) * portTICK_PERIOD_MS);
+    const uint32_t uart_age_ms = s_last_uart_activity_tick == 0 ? UINT32_MAX : (uint32_t)((now - s_last_uart_activity_tick) * portTICK_PERIOD_MS);
+    if (!lora_seen) set_status_text(s_lora_status, sizeof(s_lora_status), "IDLE");
+    else if (lora_age_ms <= GATEWAY_ACTIVITY_READY_MS) set_status_text(s_lora_status, sizeof(s_lora_status), "ONLINE");
+    else if (lora_age_ms <= GATEWAY_ACTIVITY_WARN_MS) set_status_text(s_lora_status, sizeof(s_lora_status), "QUIET");
+    else set_status_text(s_lora_status, sizeof(s_lora_status), "STALE");
+    if (!uart_seen) set_status_text(s_uart_status, sizeof(s_uart_status), "IDLE");
+    else if (uart_age_ms <= GATEWAY_ACTIVITY_READY_MS) set_status_text(s_uart_status, sizeof(s_uart_status), "BRIDGE");
+    else if (uart_age_ms <= GATEWAY_ACTIVITY_WARN_MS) set_status_text(s_uart_status, sizeof(s_uart_status), "QUIET");
+    else set_status_text(s_uart_status, sizeof(s_uart_status), "STALE");
+    if (s_wifi_connected) set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
+    else set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
 }
 
-static size_t sanitize_uart_payload(const char *in, size_t in_len, char *out, size_t out_size, bool *had_nonprintable)
-{
-    if (had_nonprintable) *had_nonprintable = false;
-    if (!out || out_size == 0) return 0;
-    if (!in || in_len == 0) {
-        out[0] = '\0';
-        return 0;
-    }
-
-    size_t j = 0;
-    bool saw_nonprintable = false;
-    for (size_t i = 0; i < in_len && j + 1 < out_size; i++) {
-        unsigned char c = (unsigned char)in[i];
-
-        if (c == '\0' || c == '\r') {
-            continue;
-        }
-        if (c == '\t') {
-            c = ' ';
-        }
-
-        if (c >= 32 && c <= 126) {
-            out[j++] = (char)c;
-        } else {
-            saw_nonprintable = true;
-        }
-    }
-    out[j] = '\0';
-
-    char *trimmed = trim_inplace(out);
-    if (trimmed != out) {
-        memmove(out, trimmed, strlen(trimmed) + 1);
-    }
-
-    if (had_nonprintable) *had_nonprintable = saw_nonprintable;
-    return strlen(out);
-}
-
-static size_t format_uart_binary_hex(const uint8_t *in, size_t in_len, char *out, size_t out_size)
-{
-    if (!out || out_size == 0) return 0;
-    if (!in || in_len == 0) {
-        out[0] = '\0';
-        return 0;
-    }
-
-    size_t limit = (in_len < UART_BINARY_HEX_MAX_BYTES) ? in_len : UART_BINARY_HEX_MAX_BYTES;
-    size_t j = 0;
-
-    int prefix = snprintf(out, out_size, "HEX:");
-    if (prefix < 0 || (size_t)prefix >= out_size) {
-        out[0] = '\0';
-        return 0;
-    }
-    j = (size_t)prefix;
-
-    for (size_t i = 0; i < limit && j + 2 < out_size; i++) {
-        int w = snprintf(out + j, out_size - j, "%02X", in[i]);
-        if (w != 2) break;
-        j += 2;
-    }
-
-    if (limit < in_len && j + 4 < out_size) {
-        memcpy(out + j, "...", 4);
-        j += 3;
-    }
-
-    return j;
-}
-
-static void forward_uart_payload_to_lora(const char *raw, int raw_len, bool use_stream_frame,
-                                         bool final_chunk, uint32_t *stream_seq, const char *reason)
-{
-    if (!raw || raw_len <= 0) return;
-
-    char cleaned[UART_LINE_MAX];
-    bool had_nonprintable = false;
-    size_t clean_len = sanitize_uart_payload(raw, (size_t)raw_len, cleaned, sizeof(cleaned), &had_nonprintable);
-
-    if (clean_len == 0) {
-        if (had_nonprintable) {
-            if (raw_len <= UART_BINARY_DROP_MAX_BYTES) {
-                ESP_LOGI(TAG, "Ignoring tiny binary UART %s (%d raw bytes)", reason, raw_len);
-                return;
-            }
-
-            char hex_msg[LORA_MAX_PAYLOAD + 1];
-            size_t hex_len = format_uart_binary_hex((const uint8_t *)raw, (size_t)raw_len,
-                                                    hex_msg, sizeof(hex_msg));
-            if (hex_len > 0) {
-                ESP_LOGI(TAG, "UART %s binary (%d raw bytes)", reason, raw_len);
-                lora_send_text(hex_msg);
-            }
-        }
-        return;
-    }
-
-    if (should_drop_uart_uplink(cleaned)) {
-        s_noisy_uplink_suppressed++;
-        TickType_t now = xTaskGetTickCount();
-        if (s_last_noisy_uplink_log_tick == 0 ||
-            (now - s_last_noisy_uplink_log_tick) >= pdMS_TO_TICKS(2000)) {
-            ESP_LOGI(TAG, "Suppressed noisy UART uplink lines=%lu (latest reason=%s)",
-                     (unsigned long)s_noisy_uplink_suppressed,
-                     reason ? reason : "n/a");
-            s_last_noisy_uplink_log_tick = now;
-        }
-        return;
-    }
-
-    if (should_rate_limit_low_priority_uplink(cleaned)) {
-        return;
-    }
-
-    if (!use_stream_frame && clean_len <= LORA_MAX_PAYLOAD) {
-        ESP_LOGI(TAG, "UART %s direct (%u bytes%s)",
-                 reason, (unsigned)clean_len, had_nonprintable ? ", sanitized" : "");
-        update_preview_text(cleaned, s_last_uplink, sizeof(s_last_uplink));
-        s_uart_forward_count++;
-        note_uart_activity();
-        lora_send_text(cleaned);
-        return;
-    }
-
-    char framed[LORA_MAX_PAYLOAD + 1];
-    int w = snprintf(framed, sizeof(framed), "S:%lu:%c:%.*s\n",
-                     (unsigned long)(*stream_seq)++,
-                     final_chunk ? 'E' : 'M',
-                     (int)clean_len, cleaned);
-    if (w > 0) {
-        ESP_LOGI(TAG, "UART %s seq=%lu (%u bytes%s)",
-                 reason,
-                 (unsigned long)(*stream_seq - 1),
-                 (unsigned)clean_len,
-                 had_nonprintable ? ", sanitized" : "");
-        update_preview_text(cleaned, s_last_uplink, sizeof(s_last_uplink));
-        s_uart_forward_count++;
-        note_uart_activity();
-        lora_send_text(framed);
-    }
-}
-
-static bool looks_like_complete_json_document(const char *payload, size_t len)
-{
-    if (!payload || len == 0) {
-        return false;
-    }
-
-    size_t start = 0;
-    while (start < len) {
-        char c = payload[start];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            start++;
-        } else {
-            break;
-        }
-    }
-    while (len > start) {
-        char c = payload[len - 1];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            len--;
-        } else {
-            break;
-        }
-    }
-    if ((len - start) < 2) {
-        return false;
-    }
-
-    if (!((payload[start] == '{' && payload[len - 1] == '}') || (payload[start] == '[' && payload[len - 1] == ']'))) {
-        return false;
-    }
-
-    int brace_depth = 0;
-    int bracket_depth = 0;
-    bool in_string = false;
-    bool escape = false;
-    for (size_t i = start; i < len; i++) {
-        char c = payload[i];
-        if (in_string) {
-            if (escape) {
-                escape = false;
-            } else if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_string = true;
-            continue;
-        }
-        if (c == '{') brace_depth++;
-        else if (c == '}') brace_depth--;
-        else if (c == '[') bracket_depth++;
-        else if (c == ']') bracket_depth--;
-        if (brace_depth < 0 || bracket_depth < 0) {
-            return false;
-        }
-    }
-
-    return !in_string && brace_depth == 0 && bracket_depth == 0;
-}
-
-static bool should_stream_idle_flush_fragment(const char *payload, int len)
-{
-    if (!payload || len <= 0) {
-        return false;
-    }
-
-    int start = 0;
-    while (start < len) {
-        char c = payload[start];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            start++;
-        } else {
-            break;
-        }
-    }
-    if (start >= len) {
-        return false;
-    }
-
-    if (payload[start] == '{' || payload[start] == '[') {
-        return !looks_like_complete_json_document(payload, (size_t)len);
-    }
-
-    return false;
-}
-static stream_frame_t parse_stream_frame(char *text)
-{
-    stream_frame_t out = {
-        .is_stream = false,
-        .has_end = true,
-        .seq = 0,
-        .payload = text
-    };
-
-    if (!text || strncmp(text, "S:", 2) != 0) {
-        return out;
-    }
-
+static stream_frame_t parse_stream_frame(char *text) {
+    stream_frame_t out = { .is_stream = false, .has_end = true, .seq = 0, .payload = text };
+    if (!text || strncmp(text, "S:", 2) != 0) return out;
     char *p = text + 2;
     char *endptr = NULL;
     unsigned long seq = strtoul(p, &endptr, 10);
-    if (endptr == p || !endptr || *endptr != ':') {
-        return out;
-    }
-
+    if (endptr == p || !endptr || *endptr != ':') return out;
     out.is_stream = true;
     out.seq = (uint32_t)seq;
-
     char *payload = endptr + 1;
-
-    // New format: S:<seq>:<M|E>:<payload>
     if ((payload[0] == 'M' || payload[0] == 'E') && payload[1] == ':') {
         out.has_end = (payload[0] == 'E');
         out.payload = payload + 2;
     } else {
-        // Backward compatibility: S:<seq>:<payload> treated as end-of-line chunk
         out.has_end = true;
         out.payload = payload;
     }
-
     return out;
 }
 
-static void validate_pin_map(void) {
-    if (GW_UART_TX_GPIO == GW_UART_RX_GPIO) {
-        ESP_LOGE(TAG, "Invalid UART pin map: TX and RX are both GPIO%d", GW_UART_TX_GPIO);
+static void forward_command_to_stm32(const char *cmd, const char *source, bool always_log) {
+    if (!cmd || cmd[0] == '\0') return;
+    char line[UART_LINE_MAX];
+    int w = snprintf(line, sizeof(line), "%s\r\n", cmd);
+    if (w <= 0) return;
+    uart_write_bytes(GW_UART, line, w);
+    note_uart_activity();
+    s_uart_forward_count++;
+    update_preview_text(cmd, s_last_uplink, sizeof(s_last_uplink));
+    if (always_log || is_manual_downlink_command(cmd)) {
+        ESP_LOGI(TAG, "%s -> STM32: %s", source ? source : "CMD", cmd);
     }
+}
 
-    const int lora_pins[] = {
-        CONFIG_MISO_GPIO,
-        CONFIG_MOSI_GPIO,
-        CONFIG_SCLK_GPIO,
-        CONFIG_NSS_GPIO,
-        CONFIG_RST_GPIO,
-        CONFIG_BUSY_GPIO
-    };
+static esp_err_t status_get_handler(httpd_req_t *req) {
+    refresh_gateway_display_states();
+    char body[512];
+    const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    const uint32_t manual_age_ms = s_last_manual_http_tick == 0 ? 0xFFFFFFFFu : (now_ms - s_last_manual_http_tick);
+    snprintf(body, sizeof(body),
+             "{\"ok\":true,\"mode\":\"manual-gateway\",\"wifiConnected\":%s,\"manualReady\":%s,\"lastManualCommand\":\"%s\",\"manualCommandCount\":%lu,\"manualCommandAgeMs\":%lu,\"lastLoRaDownlink\":\"%s\",\"lastStmForward\":\"%s\",\"loraRxCount\":%lu,\"uartForwardCount\":%lu,\"gatewayState\":\"%s\",\"loraStatus\":\"%s\",\"uartStatus\":\"%s\"}",
+             s_wifi_connected ? "true" : "false",
+             s_wifi_connected ? "true" : "false",
+             s_last_manual_http_cmd,
+             (unsigned long)s_manual_http_count,
+             (unsigned long)manual_age_ms,
+             s_last_downlink,
+             s_last_uplink,
+             (unsigned long)s_lora_rx_count,
+             (unsigned long)s_uart_forward_count,
+             s_gateway_mode, s_lora_status, s_uart_status);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
 
+static void extract_command_from_body(char *body, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!body) return;
+    char *trimmed = trim_inplace(body);
+    if (*trimmed == '{') {
+        char *cmd = strstr(trimmed, "\"cmd\"");
+        if (cmd) {
+            cmd = strchr(cmd, ':');
+            if (cmd) {
+                cmd++;
+                while (*cmd && (*cmd == ' ' || *cmd == '\t' || *cmd == '"')) cmd++;
+                size_t j = 0;
+                while (cmd[j] && cmd[j] != '"' && cmd[j] != '}' && j + 1 < out_size) {
+                    out[j] = cmd[j];
+                    j++;
+                }
+                out[j] = '\0';
+            }
+        }
+    }
+    if (out[0] == '\0') snprintf(out, out_size, "%s", trimmed);
+    char *clean = trim_inplace(out);
+    for (char *p = clean; *p; ++p) *p = (char)toupper((unsigned char)*p);
+    if (clean != out) memmove(out, clean, strlen(clean) + 1);
+}
+
+static esp_err_t command_post_handler(httpd_req_t *req) {
+    char body[192];
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+    body[received] = '\0';
+    char command[64];
+    extract_command_from_body(body, command, sizeof(command));
+    if (command[0] == '\0') return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing cmd");
+    s_manual_http_count++;
+    s_last_manual_http_tick = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    update_preview_text(command, s_last_manual_http_cmd, sizeof(s_last_manual_http_cmd));
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "MANUAL");
+    forward_command_to_stm32(command, "HTTP", true);
+    char response[160];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"forwarded\":true,\"cmd\":\"%s\",\"count\":%lu}", command, (unsigned long)s_manual_http_count);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, response);
+}
+
+static httpd_handle_t start_http_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 6;
+    config.stack_size = 6144;
+    config.server_port = 80;
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t status_uri = {.uri = "/status", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = NULL};
+        httpd_uri_t command_uri = {.uri = "/command", .method = HTTP_POST, .handler = command_post_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &status_uri);
+        httpd_register_uri_handler(server, &command_uri);
+        ESP_LOGI(TAG, "Gateway HTTP server ready: GET /status, POST /command");
+    }
+    return server;
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg; (void)event_data;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
+        ESP_LOGW(TAG, "Gateway Wi-Fi disconnected, retrying");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        s_wifi_connected = true;
+        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
+        if (!s_http_server) s_http_server = start_http_server();
+        ESP_LOGI(TAG, "Gateway Wi-Fi connected and ready for manual control at %s", GW_STA_STATIC_IP);
+    }
+}
+
+static void wifi_setup(void) {
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    esp_netif_ip_info_t ip_info;
+    ip4addr_aton(GW_STA_STATIC_IP, &ip_info.ip);
+    ip4addr_aton(GW_STA_GW, &ip_info.gw);
+    ip4addr_aton(GW_STA_NETMASK, &ip_info.netmask);
+    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(s_sta_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_sta_netif, &ip_info));
+
+    wifi_config_t sta_cfg = {0};
+    snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%s", GW_STA_SSID);
+    snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%s", GW_STA_PASS);
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
+    ESP_LOGI(TAG, "Gateway connecting to base station AP %s (manual server target %s)", GW_STA_SSID, GW_STA_STATIC_IP);
+}
+
+static void validate_pin_map(void) {
+    const int lora_pins[] = {5, 8, 9, 10, 11, 12, 13, 14};
     for (size_t i = 0; i < (sizeof(lora_pins) / sizeof(lora_pins[0])); i++) {
         if (GW_UART_TX_GPIO == lora_pins[i] || GW_UART_RX_GPIO == lora_pins[i]) {
             ESP_LOGW(TAG, "Potential pin conflict: UART pin overlaps LoRa SPI/control GPIO %d", lora_pins[i]);
@@ -694,22 +438,17 @@ static void validate_pin_map(void) {
 static void lora_setup(void) {
     ESP_LOGI(TAG, "LoRaInit...");
     LoRaInit();
-
     int rc = LoRaBegin(LORA_FREQ_HZ, LORA_TX_POWER_DBM, LORA_TCXO_VOLT, LORA_USE_LDO);
     if (rc != 0) {
         ESP_LOGE(TAG, "LoRaBegin failed (%d). Check SX1262 pins/TCXO/freq.", rc);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-
-    gateway_apply_radio_mode(RADIO_MODE_LORA);
-    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "SETUP");
-    set_status_text(s_lora_status, sizeof(s_lora_status), "READY");
-    ESP_LOGI(TAG, "LoRa/GFSK radio ready @ %d Hz", (int)LORA_FREQ_HZ);
+    LoRaConfig(LORA_SF, LORA_BW, LORA_CR, LORA_PREAMBLE, LORA_PAYLOAD_LEN, LORA_CRC_ON, LORA_INVERT_IRQ);
+    ESP_LOGI(TAG, "LoRa ready @ %d Hz", (int)LORA_FREQ_HZ);
 }
 
 static void uart_setup(void) {
     validate_pin_map();
-
     uart_config_t cfg = {
         .baud_rate = GW_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -718,167 +457,99 @@ static void uart_setup(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT
     };
-
     ESP_ERROR_CHECK(uart_driver_install(GW_UART, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, UART_EVENT_QUEUE_LEN, &s_uart_event_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(GW_UART, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_pin(GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_set_rx_full_threshold(GW_UART, 128));
     ESP_ERROR_CHECK(uart_set_rx_timeout(GW_UART, 20));
     uart_set_always_rx_timeout(GW_UART, true);
-
     ESP_ERROR_CHECK(gpio_pullup_en(GW_UART_RX_GPIO));
     ESP_ERROR_CHECK(gpio_pulldown_dis(GW_UART_RX_GPIO));
-
     set_status_text(s_uart_status, sizeof(s_uart_status), "READY");
-    ESP_LOGI(TAG, "UART ready: UART%d TX=%d RX=%d @ %d",
-             (int)GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO, GW_UART_BAUD);
+    ESP_LOGI(TAG, "UART ready: UART%d TX=%d RX=%d @ %d", (int)GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO, GW_UART_BAUD);
 }
 
 static void lora_send_text_blocking(const char *text) {
     if (!text) return;
     size_t n = strnlen(text, UART_LINE_MAX - 1);
     if (n == 0) return;
-
-    size_t payload_limit = radio_payload_limit();
-    if (n > payload_limit) {
-        ESP_LOGW(TAG, "Radio payload too long for %s (%u), truncating to %u",
-                 radio_mode_name(s_radio_mode), (unsigned)n, (unsigned)payload_limit);
-        n = payload_limit;
+    if (n > LORA_MAX_PAYLOAD) {
+        ESP_LOGW(TAG, "LoRa payload too long (%u), truncating to %u", (unsigned)n, (unsigned)LORA_MAX_PAYLOAD);
+        n = LORA_MAX_PAYLOAD;
     }
-
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
     bool sent = false;
     for (int retry = 0; retry < LORA_TX_RETRY_COUNT; retry++) {
         bool send_result = LoRaSend((uint8_t*)text, (uint8_t)n, SX126x_TXMODE_SYNC);
-        if (send_result) {
-            sent = true;
-            break;
-        }
+        if (send_result) { sent = true; break; }
         ESP_LOGW(TAG, "LoRa uplink retry %d/%d failed", retry + 1, LORA_TX_RETRY_COUNT);
         vTaskDelay(pdMS_TO_TICKS(LORA_TX_RETRY_DELAY_MS));
     }
     xSemaphoreGive(lora_tx_lock);
-
     if (!sent) {
         char preview[48];
         make_printable(text, n, preview, sizeof(preview));
-        ESP_LOGE(TAG, "LoRa uplink failed after %d attempts (%u bytes): %s",
-                 LORA_TX_RETRY_COUNT, (unsigned)n, preview);
+        ESP_LOGE(TAG, "LoRa uplink failed after %d attempts (%u bytes): %s", LORA_TX_RETRY_COUNT, (unsigned)n, preview);
     }
 }
 
-static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size)
-{
-    if (!rx || rx_size == 0) {
-        return 0;
-    }
-
+static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size) {
+    if (!rx || rx_size == 0) return 0;
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
     uint8_t count = LoRaReceive(rx, (int16_t)(rx_size - 1));
     xSemaphoreGive(lora_tx_lock);
     return count;
 }
 
-// Send a LoRa packet safely from any task without stalling producers.
 static void lora_send_text(const char *text) {
     if (!text) return;
-
-    if (!s_lora_tx_queue) {
-        lora_send_text_blocking(text);
-        return;
-    }
-
+    if (!s_lora_tx_queue) { lora_send_text_blocking(text); return; }
     lora_tx_item_t item = {0};
     snprintf(item.payload, sizeof(item.payload), "%s", text);
-
     if (xQueueSend(s_lora_tx_queue, &item, pdMS_TO_TICKS(LORA_TX_QUEUE_WAIT_MS)) != pdTRUE) {
         s_lora_tx_queue_drops++;
-        if ((s_lora_tx_queue_drops % 10U) == 1U) {
-            ESP_LOGW(TAG, "LoRa TX queue full, dropped=%lu", (unsigned long)s_lora_tx_queue_drops);
-        }
+        if ((s_lora_tx_queue_drops % 25u) == 1u) ESP_LOGW(TAG, "LoRa TX queue full, dropping payload (drops=%lu)", (unsigned long)s_lora_tx_queue_drops);
     }
 }
 
 static void lora_tx_task(void *arg) {
     (void)arg;
     lora_tx_item_t item;
-
-    while (1) {
+    for (;;) {
         if (xQueueReceive(s_lora_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
             lora_send_text_blocking(item.payload);
-            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 }
 
-// ---------------- Tasks ----------------
-
-// LoRa RX -> UART TX + ACK
 static void lora_rx_task(void *arg) {
     (void)arg;
     uint8_t rx[255];
-    char rx_log[255];
     TickType_t last_motion_log_tick = 0;
-
+    const TickType_t manual_log_interval_ticks = pdMS_TO_TICKS(GATEWAY_MOTION_LOG_THROTTLE_MS);
     while (1) {
         uint8_t n = lora_receive_locked(rx, sizeof(rx));
         if (n > 0) {
-            // Ensure it's printable as a C string
             if (n >= sizeof(rx)) n = sizeof(rx) - 1;
             rx[n] = '\0';
-            make_printable((const char *)rx, n, rx_log, sizeof(rx_log));
-            update_preview_text(rx_log, s_last_downlink, sizeof(s_last_downlink));
-            s_lora_rx_count++;
-            note_lora_activity();
-            const TickType_t now = xTaskGetTickCount();
-            const bool motion_command = is_manual_downlink_command(rx_log);
-            const bool should_log_motion = !motion_command ||
-                (now - last_motion_log_tick) >= pdMS_TO_TICKS(GATEWAY_MOTION_LOG_THROTTLE_MS);
-            if (should_log_motion) {
-                ESP_LOGI(TAG, "LoRa RX (%d): %s", n, rx_log);
-                if (motion_command) {
-                    last_motion_log_tick = now;
-                }
-            }
-
-            // Forward to STM32 as a line-based command
-            char line[UART_LINE_MAX];
             char rx_copy[UART_LINE_MAX];
             strncpy(rx_copy, (char*)rx, sizeof(rx_copy) - 1);
             rx_copy[sizeof(rx_copy) - 1] = '\0';
             char *cmd = trim_inplace(rx_copy);
-            radio_mode_t requested_mode = RADIO_MODE_LORA;
-
-            if (is_manual_downlink_command(cmd)) {
-                s_last_manual_downlink_tick = xTaskGetTickCount();
-            }
-
-            if (is_radio_switch_frame(cmd, &requested_mode)) {
-                ESP_LOGI(TAG, "Radio switch frame received: %s", radio_mode_name(requested_mode));
-                gateway_apply_radio_mode(requested_mode);
-                continue;
-            }
-
+            update_preview_text(cmd, s_last_downlink, sizeof(s_last_downlink));
+            s_lora_rx_count++;
+            note_lora_activity();
+            bool motion = is_manual_downlink_command(cmd);
+            TickType_t now = xTaskGetTickCount();
+            bool should_log_motion = !motion || last_motion_log_tick == 0 || (now - last_motion_log_tick) >= manual_log_interval_ticks;
+            if (should_log_motion && motion) last_motion_log_tick = now;
             stream_frame_t frame = parse_stream_frame(cmd);
             const char *uart_payload = frame.payload ? frame.payload : "";
-
             if (frame.is_stream) {
-                if (!rx_seq_init) {
-                    rx_seq_expected = frame.seq;
-                    rx_seq_init = true;
-                } else {
-                    if (frame.seq != rx_seq_expected) {
-                        rx_stream_len = 0;
-                        rx_seq_expected = frame.seq;
-                    }
-                }
-
+                if (!rx_seq_init) { rx_seq_expected = frame.seq; rx_seq_init = true; }
+                else if (frame.seq != rx_seq_expected) { rx_stream_len = 0; rx_seq_expected = frame.seq; }
                 size_t payload_len = strlen(uart_payload);
-                if (payload_len > 0 && uart_payload[payload_len - 1] == '\n') {
-                    payload_len--;
-                }
-
+                if (payload_len > 0 && uart_payload[payload_len - 1] == '\n') payload_len--;
                 int remain = (int)sizeof(rx_stream_buf) - 1 - rx_stream_len;
                 if (remain > 0 && payload_len > 0) {
                     size_t copy_len = payload_len > (size_t)remain ? (size_t)remain : payload_len;
@@ -886,67 +557,25 @@ static void lora_rx_task(void *arg) {
                     rx_stream_len += (int)copy_len;
                     rx_stream_buf[rx_stream_len] = '\0';
                 }
-
                 rx_seq_expected = frame.seq + 1;
-
-                if (!frame.has_end) {
-                    continue;
-                }
-
-                int w = snprintf(line, sizeof(line), "%s\r\n", rx_stream_buf);
-                if (w > 0) {
-                    uart_write_bytes(GW_UART, line, w);
-                    note_uart_activity();
-                    if (should_log_motion) {
-                        ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
-                    }
-                }
+                if (!frame.has_end) { vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS)); continue; }
+                forward_command_to_stm32(rx_stream_buf, "LoRa", should_log_motion);
                 rx_stream_len = 0;
                 rx_stream_buf[0] = '\0';
             } else {
-                // Pass through legacy/non-stream payload as one line
-                int w = snprintf(line, sizeof(line), "%s\r\n", uart_payload);
-                if (w > 0) {
-                    uart_write_bytes(GW_UART, line, w);
-                    note_uart_activity();
-                    if (should_log_motion) {
-                        ESP_LOGI(TAG, "UART TX -> STM32: %s", line);
-                    }
-                }
+                forward_command_to_stm32(uart_payload, "LoRa", should_log_motion);
             }
-
-            // Send a gateway receipt marker back over LoRa without pretending the
-            // STM32 already applied the command. The real `ACK:` should come from
-            // the STM32 response that is bridged back on UART RX.
-            if (s_radio_mode != RADIO_MODE_GFSK) {
-                char ack[80];
-                snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
-                lora_send_text(ack);
-            }
+            char ack[80];
+            snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
+            lora_send_text(ack);
         }
-
         vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
-    }
-}
-
-// Periodic gateway heartbeat -> LoRa TX
-static void gateway_heartbeat_task(void *arg) {
-    (void)arg;
-    char heartbeat[64];
-
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    while (1) {
-        snprintf(heartbeat, sizeof(heartbeat), "GW:ALIVE:%lu",
-                 (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS));
-        lora_send_text(heartbeat);
-        vTaskDelay(pdMS_TO_TICKS(GATEWAY_HEARTBEAT_INTERVAL_MS));
     }
 }
 
 static void gateway_display_task(void *arg) {
     (void)arg;
     TickType_t next_display_init_retry = 0;
-
     while (1) {
         if (!display_available) {
             TickType_t now = xTaskGetTickCount();
@@ -956,51 +585,34 @@ static void gateway_display_task(void *arg) {
                 next_display_init_retry = now + pdMS_TO_TICKS(5000);
             }
         }
-
         if (display_available) {
             refresh_gateway_display_states();
-            display_show_gateway_status(
-                s_gateway_mode,
-                s_lora_status,
-                s_uart_status,
-                s_last_downlink,
-                s_last_uplink,
-                s_lora_rx_count,
-                s_uart_forward_count);
+            display_show_gateway_status(s_gateway_mode, s_lora_status, s_uart_status, s_last_downlink, s_last_uplink, s_lora_rx_count, s_uart_forward_count);
         }
         vTaskDelay(pdMS_TO_TICKS(700));
     }
 }
 
-// UART RX -> LoRa TX
 static void uart_rx_task(void *arg) {
     (void)arg;
     char line[UART_LINE_MAX];
     int line_len = 0;
     bool line_chunked = false;
     uint32_t stream_seq = 0;
-    const int stream_payload_max = (LORA_MAX_PAYLOAD > LORA_STREAM_HEADER_RESERVE)
-        ? (LORA_MAX_PAYLOAD - LORA_STREAM_HEADER_RESERVE)
-        : LORA_MAX_PAYLOAD;
-    const int chunk_max = (stream_payload_max < LORA_STREAM_CHUNK_MAX)
-        ? stream_payload_max
-        : LORA_STREAM_CHUNK_MAX;
+    const int stream_payload_max = (LORA_MAX_PAYLOAD > LORA_STREAM_HEADER_RESERVE) ? (LORA_MAX_PAYLOAD - LORA_STREAM_HEADER_RESERVE) : LORA_MAX_PAYLOAD;
+    const int chunk_max = (stream_payload_max < LORA_STREAM_CHUNK_MAX) ? stream_payload_max : LORA_STREAM_CHUNK_MAX;
     TickType_t last_byte_tick = 0;
-
     for (;;) {
         bool saw_uart_data = false;
         if (s_uart_event_queue) {
             uart_event_t event;
             if (xQueueReceive(s_uart_event_queue, &event, pdMS_TO_TICKS(UART_READ_TIMEOUT_MS)) == pdTRUE) {
                 switch (event.type) {
-                    case UART_DATA:
-                        saw_uart_data = true;
-                        break;
+                    case UART_DATA: saw_uart_data = true; break;
                     case UART_FIFO_OVF:
                     case UART_BUFFER_FULL:
                         s_uart_overflow_count++;
-                        ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input",
-                                 (int)event.type, (unsigned long)s_uart_overflow_count);
+                        ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input", (int)event.type, (unsigned long)s_uart_overflow_count);
                         uart_flush_input(GW_UART);
                         xQueueReset(s_uart_event_queue);
                         break;
@@ -1008,75 +620,69 @@ static void uart_rx_task(void *arg) {
                     case UART_FRAME_ERR:
                         ESP_LOGW(TAG, "UART line error type=%d", (int)event.type);
                         break;
-                    default:
-                        break;
+                    default: break;
                 }
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(UART_READ_TIMEOUT_MS));
         }
-
-        // Strict event-driven read: only touch UART RX when UART_DATA was signaled.
         if (saw_uart_data) {
-            int r = uart_read_bytes(GW_UART, s_uart_rx_buf, UART_RX_MAX_BYTES_PER_PASS, pdMS_TO_TICKS(1));
-            if (r > 0) {
-            // Process data from event
-            for (int i = 0; i < r; i++) {
-                char c = (char)s_uart_rx_buf[i];
-
-                // Build stream/chunks; newline flushes the current chunk.
-                if (c == '\r' || c == '\0') continue;
-
-                if (c == '\n') {
-                    if (line_len > 0) {
-                        forward_uart_payload_to_lora(line, line_len, line_chunked, true,
-                                                     &stream_seq, line_chunked ? "RX final chunk" : "RX");
-                    }
-                    line_len = 0;
-                    line_chunked = false;
-                    last_byte_tick = 0;
-                } else {
-                    if (line_len < chunk_max) {
-                        line[line_len++] = c;
-                        last_byte_tick = xTaskGetTickCount();
-                    } else {
-                        // Stream is longer than one LoRa packet: send current chunk and continue.
-                        forward_uart_payload_to_lora(line, line_len, true, false,
-                                                     &stream_seq, "stream chunk");
-                        line_chunked = true;
+            for (int pass = 0; pass < UART_RX_MAX_PASSES_PER_CYCLE; ++pass) {
+                int read_count = uart_read_bytes(GW_UART, (uint8_t *)line + 0, UART_RX_MAX_BYTES_PER_PASS, pdMS_TO_TICKS(0));
+                if (read_count <= 0) break;
+                note_uart_activity();
+                for (int i = 0; i < read_count; i++) {
+                    char c = line[i];
+                    if ((unsigned char)c < 0x09 || (unsigned char)c == 0x7F) continue;
+                    if (c == '\r') continue;
+                    if (c == '\n') {
+                        if (line_len == 0) continue;
+                        line[line_len] = '\0';
+                        char *trimmed = trim_inplace(line);
+                        if (trimmed[0] == '\0') { line_len = 0; line_chunked = false; last_byte_tick = 0; continue; }
+                        update_preview_text(trimmed, s_last_uplink, sizeof(s_last_uplink));
+                        if (!should_drop_uart_uplink(trimmed) && !should_rate_limit_low_priority_uplink(trimmed)) {
+                            if ((int)strlen(trimmed) > chunk_max) {
+                                size_t total = strlen(trimmed);
+                                size_t offset = 0;
+                                while (offset < total) {
+                                    size_t remaining = total - offset;
+                                    size_t part = remaining > (size_t)chunk_max ? (size_t)chunk_max : remaining;
+                                    char framed[LORA_MAX_PAYLOAD + 1];
+                                    const char marker = (offset + part < total) ? 'M' : 'E';
+                                    snprintf(framed, sizeof(framed), "S:%lu:%c:%.*s", (unsigned long)stream_seq++, marker, (int)part, trimmed + offset);
+                                    lora_send_text(framed);
+                                    offset += part;
+                                }
+                            } else {
+                                lora_send_text(trimmed);
+                            }
+                        }
                         line_len = 0;
-                        line[line_len++] = c;
-                        last_byte_tick = xTaskGetTickCount();
+                        line_chunked = false;
+                        last_byte_tick = 0;
+                    } else {
+                        if (line_len < UART_LINE_MAX - 1) { line[line_len++] = c; last_byte_tick = xTaskGetTickCount(); }
+                        else { line_chunked = true; }
                     }
                 }
-            }
+                vTaskDelay(pdMS_TO_TICKS(UART_RX_DRAIN_PAUSE_MS));
             }
         }
-
         if (line_len > 0 && last_byte_tick != 0) {
             TickType_t now = xTaskGetTickCount();
-            TickType_t idle_flush_ticks = pdMS_TO_TICKS(
-                (line_len < UART_STREAM_MIN_FLUSH_BYTES)
-                    ? UART_STREAM_SHORT_IDLE_FLUSH_MS
-                    : UART_STREAM_IDLE_FLUSH_MS);
-
+            const TickType_t idle_flush_ticks = line_chunked ? pdMS_TO_TICKS(UART_STREAM_SHORT_IDLE_FLUSH_MS) : pdMS_TO_TICKS(UART_STREAM_IDLE_FLUSH_MS);
             if ((now - last_byte_tick) >= idle_flush_ticks) {
-                const bool incomplete_json = should_stream_idle_flush_fragment(line, line_len);
-                if (incomplete_json && line_len < (chunk_max - 8)) {
-                    // Keep accumulating incomplete JSON instead of splitting early.
-                    vTaskDelay(pdMS_TO_TICKS(UART_RX_LOOP_PAUSE_MS));
-                    continue;
+                line[line_len] = '\0';
+                char *trimmed = trim_inplace(line);
+                if (trimmed[0] != '\0' && !should_drop_uart_uplink(trimmed) && !should_rate_limit_low_priority_uplink(trimmed)) {
+                    lora_send_text(trimmed);
                 }
-                forward_uart_payload_to_lora(line, line_len, line_chunked || incomplete_json,
-                                             incomplete_json ? false : true,
-                                             &stream_seq,
-                                             incomplete_json ? "idle flush partial json" : "idle flush");
                 line_len = 0;
-                line_chunked = incomplete_json;
+                line_chunked = false;
                 last_byte_tick = 0;
             }
         }
-
         vTaskDelay(pdMS_TO_TICKS(UART_RX_LOOP_PAUSE_MS));
     }
 }
@@ -1086,24 +692,18 @@ void app_main(void) {
     s_lora_tx_queue = xQueueCreate(LORA_TX_QUEUE_LEN, sizeof(lora_tx_item_t));
     if (!lora_tx_lock || !s_lora_tx_queue) {
         ESP_LOGE(TAG, "Failed to create gateway sync primitives");
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-
+    wifi_setup();
     uart_setup();
     lora_setup();
     display_available = display_init();
-
     xTaskCreatePinnedToCore(lora_tx_task, "lora_tx", TASK_STACK_LORA_TX, NULL, TASK_PRIO_LORA_TX, NULL, GATEWAY_APP_CORE);
     xTaskCreatePinnedToCore(lora_rx_task, "lora_rx", TASK_STACK_LORA_RX, NULL, TASK_PRIO_LORA_RX, NULL, GATEWAY_APP_CORE);
     xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", TASK_STACK_UART_RX, NULL, TASK_PRIO_UART_RX, NULL, UART_RX_TASK_CORE);
-    // Heartbeat traffic is intentionally disabled by default to keep airtime available for real control/telemetry.
     if (display_available) {
         xTaskCreatePinnedToCore(gateway_display_task, "gw_display", TASK_STACK_DISPLAY, NULL, TASK_PRIO_DISPLAY, NULL, GATEWAY_APP_CORE);
     }
-
     set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
-    ESP_LOGI(TAG, "Robot gateway running: single-radio bridge active (%s default)", radio_mode_name(s_radio_mode));
+    ESP_LOGI(TAG, "Robot gateway running: LoRa autonomy bridge + direct manual HTTP server");
 }
-
