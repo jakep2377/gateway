@@ -41,9 +41,9 @@
 // ---------------- Gateway Wi-Fi ----------------
 #define GW_STA_SSID        "GriffiniPhone"
 #define GW_STA_PASS        "12345678"
-#define GW_STA_STATIC_IP   ""
-#define GW_STA_GW          ""
-#define GW_STA_NETMASK     ""
+#define GW_STA_STATIC_IP   "172.20.10.2"
+#define GW_STA_GW          "172.20.10.1"
+#define GW_STA_NETMASK     "255.255.255.240"
 #define GW_WIFI_CFG_PREFIX "GWCFG:WIFI:"
 #define GW_WIFI_NVS_NAMESPACE "gw_wifi"
 #define GW_WIFI_NVS_KEY_SSID "ssid"
@@ -437,6 +437,7 @@ static bool is_high_priority_manual_uplink(const char *payload) {
 
 static bool is_manual_downlink_command(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
+    if (strncmp(payload, "D:", 2) == 0 || strncmp(payload, "J:", 2) == 0 || strncmp(payload, "DRIVE,", 6) == 0) return true;
     return strcmp(payload, "MANUAL") == 0 || strcmp(payload, "PAUSE") == 0 || strcmp(payload, "AUTO") == 0 ||
            strcmp(payload, "FORWARD") == 0 || strcmp(payload, "BACKWARD") == 0 || strcmp(payload, "LEFT") == 0 ||
            strcmp(payload, "RIGHT") == 0 || strcmp(payload, "STOP") == 0 || strcmp(payload, "ESTOP") == 0;
@@ -533,14 +534,18 @@ static stream_frame_t parse_stream_frame(char *text) {
 
 static void forward_command_to_stm32(const char *cmd, const char *source, bool always_log) {
     if (!cmd || cmd[0] == '\0') return;
+    const bool manual_downlink = is_manual_downlink_command(cmd);
     char line[UART_LINE_MAX];
     int w = snprintf(line, sizeof(line), "%s\r\n", cmd);
     if (w <= 0) return;
     uart_write_bytes(GW_UART, line, w);
+    if (manual_downlink) {
+        s_last_manual_downlink_tick = xTaskGetTickCount();
+    }
     note_uart_activity();
     s_uart_forward_count++;
     update_preview_text(cmd, s_last_uplink, sizeof(s_last_uplink));
-    if (always_log || is_manual_downlink_command(cmd)) {
+    if (always_log || manual_downlink) {
         ESP_LOGI(TAG, "%s -> STM32: %s", source ? source : "CMD", cmd);
     }
 }
@@ -641,23 +646,27 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         vTaskDelay(pdMS_TO_TICKS(1200));
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
+        char ip_text[16] = {0};
         s_wifi_connected = true;
         set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
         if (!s_http_server) s_http_server = start_http_server();
-        ESP_LOGI(TAG, "Gateway Wi-Fi connected and ready for manual control at %s", s_wifi_cfg.ip);
+        if (got_ip) {
+            snprintf(ip_text, sizeof(ip_text), IPSTR, IP2STR(&got_ip->ip_info.ip));
+        } else {
+            snprintf(ip_text, sizeof(ip_text), "%s", s_wifi_cfg.ip[0] ? s_wifi_cfg.ip : "unknown");
+        }
+        ESP_LOGI(TAG, "Gateway Wi-Fi connected and ready for manual control at http://%s", ip_text);
     }
 }
 
 static void wifi_setup(void) {
-    wifi_runtime_cfg_t persisted_cfg = {0};
-    if (load_wifi_cfg_from_nvs(&persisted_cfg)) {
-        s_wifi_cfg = persisted_cfg;
-        ESP_LOGI(TAG, "Loaded persisted gateway Wi-Fi cfg: ssid=%s ip=%s gw=%s",
-                 s_wifi_cfg.ssid, s_wifi_cfg.ip, s_wifi_cfg.gw);
-    } else {
-        ESP_LOGI(TAG, "No persisted gateway Wi-Fi cfg found; using built-in config: ssid=%s",
-                 s_wifi_cfg.ssid);
-    }
+    snprintf(s_wifi_cfg.ssid, sizeof(s_wifi_cfg.ssid), "%s", GW_STA_SSID);
+    snprintf(s_wifi_cfg.pass, sizeof(s_wifi_cfg.pass), "%s", GW_STA_PASS);
+    snprintf(s_wifi_cfg.ip, sizeof(s_wifi_cfg.ip), "%s", GW_STA_STATIC_IP);
+    snprintf(s_wifi_cfg.gw, sizeof(s_wifi_cfg.gw), "%s", GW_STA_GW);
+    snprintf(s_wifi_cfg.netmask, sizeof(s_wifi_cfg.netmask), "%s", GW_STA_NETMASK);
+    ESP_LOGI(TAG, "Using hardcoded gateway Wi-Fi cfg: ssid=%s", s_wifi_cfg.ssid);
 
     esp_err_t err = start_or_reconfigure_wifi_from_cfg(&s_wifi_cfg);
     if (err != ESP_OK) {
