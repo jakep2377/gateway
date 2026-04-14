@@ -131,6 +131,7 @@ static uint32_t s_noisy_uplink_suppressed = 0;
 static TickType_t s_last_noisy_uplink_log_tick = 0;
 static TickType_t s_last_low_priority_uplink_tick = 0;
 static TickType_t s_last_manual_downlink_tick = 0;
+static TickType_t s_last_lora_tx_fail_tick = 0;
 
 static bool rx_seq_init = false;
 static uint32_t rx_seq_expected = 0;
@@ -493,7 +494,7 @@ static void lora_send_text_blocking(const char *text) {
     if (!sent) {
         s_lora_tx_fail_count++;
         s_last_lora_tx_fail_tick = xTaskGetTickCount();
-        set_cmd_status("FAILED");
+        set_status_text(s_cmd_status, sizeof(s_cmd_status), "FAILED");
         char preview[48];
         make_printable(text, n, preview, sizeof(preview));
         ESP_LOGE(TAG, "LoRa uplink failed after %d attempts (%u bytes): %s", LORA_TX_RETRY_COUNT, (unsigned)n, preview);
