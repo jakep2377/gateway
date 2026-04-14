@@ -15,8 +15,9 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
-#include "lwip/ip4_addr.h"
+#include "nvs.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
@@ -38,11 +39,18 @@
 #define LORA_INVERT_IRQ    false
 
 // ---------------- Gateway Wi-Fi ----------------
-#define GW_STA_SSID        "SaltRobot_Base"
-#define GW_STA_PASS        "saltrobot123"
-#define GW_STA_STATIC_IP   "192.168.4.2"
-#define GW_STA_GW          "192.168.4.1"
-#define GW_STA_NETMASK     "255.255.255.0"
+#define GW_STA_SSID        "GriffiniPhone"
+#define GW_STA_PASS        "12345678"
+#define GW_STA_STATIC_IP   ""
+#define GW_STA_GW          ""
+#define GW_STA_NETMASK     ""
+#define GW_WIFI_CFG_PREFIX "GWCFG:WIFI:"
+#define GW_WIFI_NVS_NAMESPACE "gw_wifi"
+#define GW_WIFI_NVS_KEY_SSID "ssid"
+#define GW_WIFI_NVS_KEY_PASS "pass"
+#define GW_WIFI_NVS_KEY_IP "ip"
+#define GW_WIFI_NVS_KEY_GW "gw"
+#define GW_WIFI_NVS_KEY_MASK "mask"
 
 // ---------------- UART settings ----------------
 #define GW_UART            UART_NUM_1
@@ -105,10 +113,28 @@ static TickType_t s_last_lora_activity_tick = 0;
 static TickType_t s_last_uart_activity_tick = 0;
 static httpd_handle_t s_http_server = NULL;
 static esp_netif_t *s_sta_netif = NULL;
+static bool s_wifi_stack_ready = false;
+static bool s_wifi_started = false;
 static bool s_wifi_connected = false;
 static uint32_t s_manual_http_count = 0;
 static uint32_t s_last_manual_http_tick = 0;
 static char s_last_manual_http_cmd[32] = "none";
+
+typedef struct {
+    char ssid[33];
+    char pass[65];
+    char ip[16];
+    char gw[16];
+    char netmask[16];
+} wifi_runtime_cfg_t;
+
+static wifi_runtime_cfg_t s_wifi_cfg = {
+    .ssid = GW_STA_SSID,
+    .pass = GW_STA_PASS,
+    .ip = GW_STA_STATIC_IP,
+    .gw = GW_STA_GW,
+    .netmask = GW_STA_NETMASK,
+};
 
 typedef struct {
     bool is_stream;
@@ -141,6 +167,222 @@ static int rx_stream_len = 0;
 static void lora_send_text_blocking(const char *text);
 static void lora_send_text(const char *text);
 static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size);
+static char* trim_inplace(char *s);
+static void set_status_text(char *target, size_t target_size, const char *value);
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+static esp_err_t start_or_reconfigure_wifi_from_cfg(const wifi_runtime_cfg_t *cfg);
+
+static esp_err_t save_wifi_cfg_to_nvs(const wifi_runtime_cfg_t *cfg) {
+    if (!cfg || cfg->ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(GW_WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_str(nvs, GW_WIFI_NVS_KEY_SSID, cfg->ssid);
+    if (err == ESP_OK) err = nvs_set_str(nvs, GW_WIFI_NVS_KEY_PASS, cfg->pass);
+    if (err == ESP_OK) err = nvs_set_str(nvs, GW_WIFI_NVS_KEY_IP, cfg->ip);
+    if (err == ESP_OK) err = nvs_set_str(nvs, GW_WIFI_NVS_KEY_GW, cfg->gw);
+    if (err == ESP_OK) err = nvs_set_str(nvs, GW_WIFI_NVS_KEY_MASK, cfg->netmask);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+
+    nvs_close(nvs);
+    return err;
+}
+
+static bool load_wifi_cfg_from_nvs(wifi_runtime_cfg_t *out) {
+    if (!out) return false;
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(GW_WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) return false;
+
+    wifi_runtime_cfg_t loaded = {0};
+    size_t len = sizeof(loaded.ssid);
+    err = nvs_get_str(nvs, GW_WIFI_NVS_KEY_SSID, loaded.ssid, &len);
+    if (err != ESP_OK || loaded.ssid[0] == '\0') {
+        nvs_close(nvs);
+        return false;
+    }
+
+    len = sizeof(loaded.pass);
+    if (nvs_get_str(nvs, GW_WIFI_NVS_KEY_PASS, loaded.pass, &len) != ESP_OK) loaded.pass[0] = '\0';
+    len = sizeof(loaded.ip);
+    if (nvs_get_str(nvs, GW_WIFI_NVS_KEY_IP, loaded.ip, &len) != ESP_OK) loaded.ip[0] = '\0';
+    len = sizeof(loaded.gw);
+    if (nvs_get_str(nvs, GW_WIFI_NVS_KEY_GW, loaded.gw, &len) != ESP_OK) loaded.gw[0] = '\0';
+    len = sizeof(loaded.netmask);
+    if (nvs_get_str(nvs, GW_WIFI_NVS_KEY_MASK, loaded.netmask, &len) != ESP_OK) loaded.netmask[0] = '\0';
+
+    nvs_close(nvs);
+    *out = loaded;
+    return true;
+}
+
+static bool parse_ipv4_text(const char *text, uint8_t *a, uint8_t *b, uint8_t *c, uint8_t *d) {
+    if (!text || !a || !b || !c || !d) return false;
+    unsigned int o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+    if (sscanf(text, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) != 4) return false;
+    if (o0 > 255 || o1 > 255 || o2 > 255 || o3 > 255) return false;
+    *a = (uint8_t)o0;
+    *b = (uint8_t)o1;
+    *c = (uint8_t)o2;
+    *d = (uint8_t)o3;
+    return true;
+}
+
+static esp_err_t apply_wifi_sta_config(const wifi_runtime_cfg_t *cfg, bool reconnect_now) {
+    if (!cfg || cfg->ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (!s_sta_netif) return ESP_ERR_INVALID_STATE;
+
+    if (cfg->ip[0] != '\0' && cfg->gw[0] != '\0' && cfg->netmask[0] != '\0') {
+        esp_netif_ip_info_t ip_info = {0};
+        uint8_t a = 0, b = 0, c = 0, d = 0;
+        if (!parse_ipv4_text(cfg->ip, &a, &b, &c, &d)) return ESP_ERR_INVALID_ARG;
+        esp_netif_set_ip4_addr(&ip_info.ip, a, b, c, d);
+        if (!parse_ipv4_text(cfg->gw, &a, &b, &c, &d)) return ESP_ERR_INVALID_ARG;
+        esp_netif_set_ip4_addr(&ip_info.gw, a, b, c, d);
+        if (!parse_ipv4_text(cfg->netmask, &a, &b, &c, &d)) return ESP_ERR_INVALID_ARG;
+        esp_netif_set_ip4_addr(&ip_info.netmask, a, b, c, d);
+        esp_netif_dhcpc_stop(s_sta_netif);
+        ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(s_sta_netif, &ip_info), TAG, "Failed setting static IP info");
+    } else {
+        ESP_LOGI(TAG, "Using DHCP for gateway STA (same hotspot as base station)");
+        esp_netif_dhcpc_start(s_sta_netif);
+    }
+
+    wifi_config_t sta_cfg = {0};
+    strncpy((char *)sta_cfg.sta.ssid, cfg->ssid, sizeof(sta_cfg.sta.ssid) - 1);
+    sta_cfg.sta.ssid[sizeof(sta_cfg.sta.ssid) - 1] = '\0';
+    strncpy((char *)sta_cfg.sta.password, cfg->pass, sizeof(sta_cfg.sta.password) - 1);
+    sta_cfg.sta.password[sizeof(sta_cfg.sta.password) - 1] = '\0';
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg), TAG, "Failed applying STA config");
+
+    if (reconnect_now) {
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(120));
+        ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "Failed reconnecting with new Wi-Fi config");
+    }
+    return ESP_OK;
+}
+
+static bool parse_wifi_cfg_message(const char *payload, wifi_runtime_cfg_t *out) {
+    if (!payload || !out) return false;
+    if (strncmp(payload, GW_WIFI_CFG_PREFIX, strlen(GW_WIFI_CFG_PREFIX)) != 0) return false;
+
+    char buffer[200];
+    snprintf(buffer, sizeof(buffer), "%s", payload + strlen(GW_WIFI_CFG_PREFIX));
+
+    char *ctx = NULL;
+    char *ssid = strtok_r(buffer, "|", &ctx);
+    char *pass = strtok_r(NULL, "|", &ctx);
+    char *ip = strtok_r(NULL, "|", &ctx);
+    char *gw = strtok_r(NULL, "|", &ctx);
+    char *mask = strtok_r(NULL, "|", &ctx);
+    if (!ssid || !pass) return false;
+
+    ssid = trim_inplace(ssid);
+    pass = trim_inplace(pass);
+    ip = ip ? trim_inplace(ip) : "";
+    gw = gw ? trim_inplace(gw) : "";
+    mask = mask ? trim_inplace(mask) : "";
+    if (ssid[0] == '\0') return false;
+
+    snprintf(out->ssid, sizeof(out->ssid), "%s", ssid);
+    snprintf(out->pass, sizeof(out->pass), "%s", pass);
+    snprintf(out->ip, sizeof(out->ip), "%s", ip);
+    snprintf(out->gw, sizeof(out->gw), "%s", gw);
+    snprintf(out->netmask, sizeof(out->netmask), "%s", mask);
+    return true;
+}
+
+static esp_err_t wifi_stack_init_once(void) {
+    if (s_wifi_stack_ready) return ESP_OK;
+
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "nvs erase failed");
+        nvs_err = nvs_flash_init();
+    }
+    ESP_RETURN_ON_ERROR(nvs_err, TAG, "nvs init failed");
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
+    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop create failed");
+
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    if (!s_sta_netif) return ESP_FAIL;
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "esp_wifi_init failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL), TAG, "wifi event register failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL), TAG, "ip event register failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set wifi mode failed");
+
+    s_wifi_stack_ready = true;
+    return ESP_OK;
+}
+
+static esp_err_t start_or_reconfigure_wifi_from_cfg(const wifi_runtime_cfg_t *cfg) {
+    ESP_RETURN_ON_ERROR(wifi_stack_init_once(), TAG, "wifi stack init failed");
+
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(apply_wifi_sta_config(cfg, false), TAG, "apply sta cfg failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+        s_wifi_started = true;
+        set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
+        ESP_LOGI(TAG, "Gateway Wi-Fi start requested from LoRa cfg: ssid=%s", cfg->ssid);
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(apply_wifi_sta_config(cfg, true), TAG, "reconfigure sta cfg failed");
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
+    ESP_LOGI(TAG, "Gateway Wi-Fi reconfigured from LoRa cfg: ssid=%s", cfg->ssid);
+    return ESP_OK;
+}
+
+static bool handle_gateway_control_command(const char *cmd) {
+    if (!cmd) return false;
+    if (strncmp(cmd, GW_WIFI_CFG_PREFIX, strlen(GW_WIFI_CFG_PREFIX)) != 0) return false;
+
+    // Ignore reflected status/ack frames (e.g. GWCFG:WIFI:OK) to prevent control chatter loops.
+    if (strchr(cmd, '|') == NULL) {
+        return true;
+    }
+
+    wifi_runtime_cfg_t next_cfg = s_wifi_cfg;
+    if (!parse_wifi_cfg_message(cmd, &next_cfg)) {
+        ESP_LOGW(TAG, "Rejected Wi-Fi cfg command (format): %s", cmd);
+        lora_send_text("GWCFG:WIFI:ERR:FORMAT");
+        return true;
+    }
+
+    esp_err_t err = start_or_reconfigure_wifi_from_cfg(&next_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Rejected Wi-Fi cfg command (apply err=0x%x)", (unsigned)err);
+        lora_send_text("GWCFG:WIFI:ERR:APPLY");
+        return true;
+    }
+
+    err = save_wifi_cfg_to_nvs(&next_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Rejected Wi-Fi cfg persistence (save err=0x%x)", (unsigned)err);
+        lora_send_text("GWCFG:WIFI:ERR:SAVE");
+        return true;
+    }
+
+    s_wifi_cfg = next_cfg;
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
+    ESP_LOGI(TAG, "Applied Wi-Fi cfg from LoRa: ssid=%s ip=%s gw=%s", s_wifi_cfg.ssid, s_wifi_cfg.ip, s_wifi_cfg.gw);
+    lora_send_text_blocking("GWCFG:WIFI:OK");
+    ESP_LOGW(TAG, "Restarting gateway to finalize Wi-Fi credential update");
+    vTaskDelay(pdMS_TO_TICKS(250));
+    esp_restart();
+    return true;
+}
 
 static char* trim_inplace(char *s) {
     if (!s) return s;
@@ -228,6 +470,13 @@ static bool should_rate_limit_low_priority_uplink(const char *payload) {
     if (s_last_low_priority_uplink_tick != 0 && (now - s_last_low_priority_uplink_tick) < pdMS_TO_TICKS(LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS)) return true;
     s_last_low_priority_uplink_tick = now;
     return false;
+}
+
+static bool is_gateway_ack_or_status_frame(const char *payload) {
+    if (!payload || payload[0] == '\0') return false;
+    return strncmp(payload, "GWRX:", 5) == 0 ||
+           strncmp(payload, "GWCFG:WIFI:OK", 13) == 0 ||
+           strncmp(payload, "GWCFG:WIFI:ERR", 14) == 0;
 }
 
 static bool preview_present(const char *value) {
@@ -380,55 +629,40 @@ static httpd_handle_t start_http_server(void) {
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    (void)arg; (void)event_data;
+    (void)arg;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *disc = (const wifi_event_sta_disconnected_t *)event_data;
+        int reason = disc ? (int)disc->reason : -1;
         s_wifi_connected = false;
         set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
-        ESP_LOGW(TAG, "Gateway Wi-Fi disconnected, retrying");
+        ESP_LOGW(TAG, "Gateway Wi-Fi disconnected (reason=%d), retrying", reason);
+        vTaskDelay(pdMS_TO_TICKS(1200));
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         s_wifi_connected = true;
         set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
         if (!s_http_server) s_http_server = start_http_server();
-        ESP_LOGI(TAG, "Gateway Wi-Fi connected and ready for manual control at %s", GW_STA_STATIC_IP);
+        ESP_LOGI(TAG, "Gateway Wi-Fi connected and ready for manual control at %s", s_wifi_cfg.ip);
     }
 }
 
 static void wifi_setup(void) {
-    esp_err_t nvs_err = nvs_flash_init();
-    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        nvs_err = nvs_flash_init();
+    wifi_runtime_cfg_t persisted_cfg = {0};
+    if (load_wifi_cfg_from_nvs(&persisted_cfg)) {
+        s_wifi_cfg = persisted_cfg;
+        ESP_LOGI(TAG, "Loaded persisted gateway Wi-Fi cfg: ssid=%s ip=%s gw=%s",
+                 s_wifi_cfg.ssid, s_wifi_cfg.ip, s_wifi_cfg.gw);
+    } else {
+        ESP_LOGI(TAG, "No persisted gateway Wi-Fi cfg found; using built-in config: ssid=%s",
+                 s_wifi_cfg.ssid);
     }
-    ESP_ERROR_CHECK(nvs_err);
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    esp_netif_ip_info_t ip_info;
-    ip4addr_aton(GW_STA_STATIC_IP, &ip_info.ip);
-    ip4addr_aton(GW_STA_GW, &ip_info.gw);
-    ip4addr_aton(GW_STA_NETMASK, &ip_info.netmask);
-    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(s_sta_netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_sta_netif, &ip_info));
-
-    wifi_config_t sta_cfg = {0};
-    snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%s", GW_STA_SSID);
-    snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%s", GW_STA_PASS);
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    sta_cfg.sta.pmf_cfg.capable = true;
-    sta_cfg.sta.pmf_cfg.required = false;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
-    ESP_LOGI(TAG, "Gateway connecting to base station AP %s (manual server target %s)", GW_STA_SSID, GW_STA_STATIC_IP);
+    esp_err_t err = start_or_reconfigure_wifi_from_cfg(&s_wifi_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Gateway Wi-Fi startup failed (err=0x%x); LoRa config updates can still reconfigure it later", (unsigned)err);
+    }
 }
 
 static void validate_pin_map(void) {
@@ -547,10 +781,18 @@ static void lora_rx_task(void *arg) {
             update_preview_text(cmd, s_last_downlink, sizeof(s_last_downlink));
             s_lora_rx_count++;
             note_lora_activity();
+            if (is_gateway_ack_or_status_frame(cmd)) {
+                vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
+                continue;
+            }
             bool motion = is_manual_downlink_command(cmd);
             TickType_t now = xTaskGetTickCount();
             bool should_log_motion = !motion || last_motion_log_tick == 0 || (now - last_motion_log_tick) >= manual_log_interval_ticks;
             if (should_log_motion && motion) last_motion_log_tick = now;
+            if (handle_gateway_control_command(cmd)) {
+                vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
+                continue;
+            }
             stream_frame_t frame = parse_stream_frame(cmd);
             const char *uart_payload = frame.payload ? frame.payload : "";
             if (frame.is_stream) {
@@ -574,7 +816,7 @@ static void lora_rx_task(void *arg) {
                 forward_command_to_stm32(uart_payload, "LoRa", should_log_motion);
             }
             char ack[80];
-            snprintf(ack, sizeof(ack), "GWRX:%.69s", (char*)rx);
+            snprintf(ack, sizeof(ack), "GWRX:%.69s", cmd);
             lora_send_text(ack);
         }
         vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
@@ -595,7 +837,18 @@ static void gateway_display_task(void *arg) {
         }
         if (display_available) {
             refresh_gateway_display_states();
-            display_show_gateway_status(s_gateway_mode, s_lora_status, s_uart_status, s_last_downlink, s_last_uplink, s_lora_rx_count, s_uart_forward_count);
+            display_show_gateway_status(s_gateway_mode,
+                                        s_lora_status,
+                                        s_cmd_status,
+                                        s_uart_status,
+                                        s_last_downlink,
+                                        s_last_uplink,
+                                        s_alert_headline,
+                                        s_alert_detail,
+                                        s_lora_rx_count,
+                                        s_uart_forward_count,
+                                        s_lora_tx_queue_drops,
+                                        s_uart_overflow_count);
         }
         vTaskDelay(pdMS_TO_TICKS(700));
     }
@@ -702,9 +955,9 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to create gateway sync primitives");
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    wifi_setup();
     uart_setup();
     lora_setup();
+    wifi_setup();
     display_available = display_init();
     xTaskCreatePinnedToCore(lora_tx_task, "lora_tx", TASK_STACK_LORA_TX, NULL, TASK_PRIO_LORA_TX, NULL, GATEWAY_APP_CORE);
     xTaskCreatePinnedToCore(lora_rx_task, "lora_rx", TASK_STACK_LORA_RX, NULL, TASK_PRIO_LORA_RX, NULL, GATEWAY_APP_CORE);
@@ -712,6 +965,6 @@ void app_main(void) {
     if (display_available) {
         xTaskCreatePinnedToCore(gateway_display_task, "gw_display", TASK_STACK_DISPLAY, NULL, TASK_PRIO_DISPLAY, NULL, GATEWAY_APP_CORE);
     }
-    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "READY");
-    ESP_LOGI(TAG, "Robot gateway running: LoRa autonomy bridge + direct manual HTTP server");
+    set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "LORA");
+    ESP_LOGI(TAG, "Robot gateway running: LoRa bridge active, Wi-Fi startup uses saved or built-in config");
 }
