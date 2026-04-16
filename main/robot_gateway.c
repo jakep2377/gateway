@@ -447,12 +447,24 @@ static bool is_high_priority_manual_uplink(const char *payload) {
 
 static bool is_manual_downlink_command(const char *payload) {
     static const char *const manual_tokens[] = {
-        "MANUAL", "PAUSE", "AUTO", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP", "ESTOP",
+        "MANUAL", "PAUSE", "AUTO",
+        "FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP", "ESTOP",
     };
 
     if (!payload || payload[0] == '\0') return false;
-    if (strncmp(payload, "D:", 2) == 0 || strncmp(payload, "J:", 2) == 0 || strncmp(payload, "DRIVE,", 6) == 0) return true;
-    return matches_any_token(payload, manual_tokens, sizeof(manual_tokens) / sizeof(manual_tokens[0]));
+
+    // Existing joystick + drive formats
+    if (strncmp(payload, "D:", 2) == 0 ||
+        strncmp(payload, "J:", 2) == 0 ||
+        strncmp(payload, "DRIVE,", 6) == 0) {
+        return true;
+    }
+
+    if (strncmp(payload, "TEST SALT", 9) == 0) return true;
+    if (strncmp(payload, "TEST BRINE", 10) == 0) return true;
+
+    return matches_any_token(payload, manual_tokens,
+        sizeof(manual_tokens) / sizeof(manual_tokens[0]));
 }
 
 static bool should_suppress_uplink_in_manual_mode(const char *payload) {
