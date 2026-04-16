@@ -611,11 +611,11 @@ static void extract_command_from_body(char *body, char *out, size_t out_size) {
 }
 
 static esp_err_t command_post_handler(httpd_req_t *req) {
-    char body[192];
+    char body[384];
     int received = httpd_req_recv(req, body, sizeof(body) - 1);
     if (received <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
     body[received] = '\0';
-    char command[64];
+    char command[256];
     extract_command_from_body(body, command, sizeof(command));
     if (command[0] == '\0') return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing cmd");
     s_manual_http_count++;
