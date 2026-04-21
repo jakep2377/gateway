@@ -24,6 +24,13 @@
 #include "ra01s.h"
 #include "display.h"
 
+// This firmware is the bridge between three worlds:
+// 1. the base station speaking LoRa,
+// 2. the STM32 robot controller speaking UART,
+// 3. and operators on the local Wi-Fi network speaking HTTP.
+// Most of the file is dedicated to making those transports cooperate without
+// flooding each other or losing the latest manual-control intent.
+
 // ---------------- LoRa settings ----------------
 #define LORA_FREQ_HZ       915000000
 #define LORA_TX_POWER_DBM  22
@@ -119,6 +126,24 @@ static bool s_wifi_connected = false;
 static uint32_t s_manual_http_count = 0;
 static uint32_t s_last_manual_http_tick = 0;
 static char s_last_manual_http_cmd[32] = "none";
+// Cache the latest robot-side telemetry that was observed on the UART uplink so
+// the gateway status endpoint can expose "live enough" operator diagnostics even
+// when the browser is only talking to the gateway.
+static char s_live_robot_state[16] = "UNKNOWN";
+static float s_live_heading_deg = 0.0f;
+static float s_live_gps_hdop = 0.0f;
+static int s_live_gps_sat = -1;
+static int s_live_prox_left = -1;
+static int s_live_prox_right = -1;
+static double s_live_lat = 0.0;
+static double s_live_lon = 0.0;
+static bool s_live_has_heading = false;
+static bool s_live_has_gps_hdop = false;
+static bool s_live_has_gps_sat = false;
+static bool s_live_has_prox_left = false;
+static bool s_live_has_prox_right = false;
+static bool s_live_has_location = false;
+static TickType_t s_last_live_telemetry_tick = 0;
 
 typedef struct {
     char ssid[33];
@@ -429,6 +454,127 @@ static void set_status_text(char *target, size_t target_size, const char *value)
     snprintf(target, target_size, "%s", value ? value : "none");
 }
 
+// The robot emits lightweight JSON-ish fragments and short text frames instead
+// of a single rigid schema, so the gateway uses forgiving keyed parsers here
+// instead of pulling in a full JSON parser for the hot UART receive path.
+static bool extract_named_float(const char *payload, const char *key, float *out) {
+    if (!payload || !key || !out) return false;
+    const char *match = strstr(payload, key);
+    if (!match) return false;
+    const char *cursor = strchr(match, ':');
+    if (!cursor) return false;
+    cursor++;
+    while (*cursor && (isspace((unsigned char)*cursor) || *cursor == '"')) cursor++;
+    char *endptr = NULL;
+    float value = strtof(cursor, &endptr);
+    if (endptr == cursor) return false;
+    *out = value;
+    return true;
+}
+
+static bool extract_named_double(const char *payload, const char *key, double *out) {
+    if (!payload || !key || !out) return false;
+    const char *match = strstr(payload, key);
+    if (!match) return false;
+    const char *cursor = strchr(match, ':');
+    if (!cursor) return false;
+    cursor++;
+    while (*cursor && (isspace((unsigned char)*cursor) || *cursor == '"')) cursor++;
+    char *endptr = NULL;
+    double value = strtod(cursor, &endptr);
+    if (endptr == cursor) return false;
+    *out = value;
+    return true;
+}
+
+static bool extract_named_string(const char *payload, const char *key, char *out, size_t out_size) {
+    if (!payload || !key || !out || out_size == 0) return false;
+    const char *match = strstr(payload, key);
+    if (!match) return false;
+    const char *cursor = strchr(match, ':');
+    if (!cursor) return false;
+    cursor++;
+    while (*cursor && (isspace((unsigned char)*cursor) || *cursor == '"')) cursor++;
+    size_t len = 0;
+    while (cursor[len] && cursor[len] != '"' && cursor[len] != ',' && cursor[len] != '}' && len + 1 < out_size) {
+        out[len] = cursor[len];
+        len++;
+    }
+    out[len] = '\0';
+    return len > 0;
+}
+
+// Update the in-memory telemetry snapshot opportunistically from any UART line
+// that looks like state, heading, GPS, or proximity data. This does not affect
+// forwarding; it only enriches the local status API and display state.
+static void update_live_robot_telemetry(const char *payload) {
+    if (!payload || payload[0] == '\0') return;
+
+    bool changed = false;
+
+    if (strncmp(payload, "ACK:STATE:", 10) == 0) {
+        set_status_text(s_live_robot_state, sizeof(s_live_robot_state), payload + 10);
+        s_last_live_telemetry_tick = xTaskGetTickCount();
+        return;
+    }
+
+    char state_text[16] = {0};
+    if (extract_named_string(payload, "\"state\"", state_text, sizeof(state_text))) {
+        set_status_text(s_live_robot_state, sizeof(s_live_robot_state), state_text);
+        changed = true;
+    }
+
+    float value_f = 0.0f;
+    if (extract_named_float(payload, "\"yaw\"", &value_f) ||
+        extract_named_float(payload, "\"headingDeg\"", &value_f) ||
+        extract_named_float(payload, "\"heading\"", &value_f)) {
+        s_live_heading_deg = value_f;
+        s_live_has_heading = true;
+        changed = true;
+    } else if (strncmp(payload, "M:", 2) == 0 && sscanf(payload + 2, "%f", &value_f) == 1) {
+        s_live_heading_deg = value_f;
+        s_live_has_heading = true;
+        changed = true;
+    }
+
+    if (extract_named_float(payload, "\"gpsSat\"", &value_f) || extract_named_float(payload, "\"sat\"", &value_f)) {
+        s_live_gps_sat = (int)value_f;
+        s_live_has_gps_sat = true;
+        changed = true;
+    }
+
+    if (extract_named_float(payload, "\"gpsHdop\"", &value_f) || extract_named_float(payload, "\"hdop\"", &value_f)) {
+        s_live_gps_hdop = value_f;
+        s_live_has_gps_hdop = true;
+        changed = true;
+    }
+
+    if (extract_named_float(payload, "\"left\"", &value_f) || extract_named_float(payload, "\"pl\"", &value_f)) {
+        s_live_prox_left = (int)value_f;
+        s_live_has_prox_left = true;
+        changed = true;
+    }
+
+    if (extract_named_float(payload, "\"right\"", &value_f) || extract_named_float(payload, "\"pr\"", &value_f)) {
+        s_live_prox_right = (int)value_f;
+        s_live_has_prox_right = true;
+        changed = true;
+    }
+
+    double lat = 0.0;
+    double lon = 0.0;
+    if (extract_named_double(payload, "\"lat\"", &lat) && extract_named_double(payload, "\"lon\"", &lon)) {
+        s_live_lat = lat;
+        s_live_lon = lon;
+        s_live_has_location = true;
+        changed = true;
+    }
+
+    if (changed) {
+        s_last_live_telemetry_tick = xTaskGetTickCount();
+    }
+}
+
 static bool matches_any_token(const char *value, const char *const *tokens, size_t token_count) {
     if (!value || !tokens || token_count == 0) return false;
     for (size_t i = 0; i < token_count; i++) {
@@ -447,7 +593,7 @@ static bool is_high_priority_manual_uplink(const char *payload) {
 
 static bool is_manual_downlink_command(const char *payload) {
     static const char *const manual_tokens[] = {
-        "MANUAL", "PAUSE", "AUTO",
+        "MANUAL", "PAUSE", "AUTO", "RESET",
         "FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP", "ESTOP",
     };
 
@@ -576,11 +722,37 @@ static void forward_command_to_stm32(const char *cmd, const char *source, bool a
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
     refresh_gateway_display_states();
-    char body[512];
-    const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    char body[1024];
+    char heading_json[24] = "null";
+    char gps_sat_json[16] = "null";
+    char gps_hdop_json[24] = "null";
+    char prox_left_json[16] = "null";
+    char prox_right_json[16] = "null";
+    char lat_json[32] = "null";
+    char lon_json[32] = "null";
+    char telemetry_age_json[16] = "null";
+    const TickType_t now_tick = xTaskGetTickCount();
+    const uint32_t now_ms = (uint32_t)(now_tick * portTICK_PERIOD_MS);
     const uint32_t manual_age_ms = s_last_manual_http_tick == 0 ? 0xFFFFFFFFu : (now_ms - s_last_manual_http_tick);
+
+    // Keep absent telemetry fields as JSON null so the client can distinguish
+    // "not observed yet" from a legitimate numeric zero.
+    if (s_live_has_heading) snprintf(heading_json, sizeof(heading_json), "%.1f", s_live_heading_deg);
+    if (s_live_has_gps_sat) snprintf(gps_sat_json, sizeof(gps_sat_json), "%d", s_live_gps_sat);
+    if (s_live_has_gps_hdop) snprintf(gps_hdop_json, sizeof(gps_hdop_json), "%.1f", s_live_gps_hdop);
+    if (s_live_has_prox_left) snprintf(prox_left_json, sizeof(prox_left_json), "%d", s_live_prox_left);
+    if (s_live_has_prox_right) snprintf(prox_right_json, sizeof(prox_right_json), "%d", s_live_prox_right);
+    if (s_live_has_location) {
+        snprintf(lat_json, sizeof(lat_json), "%.6f", s_live_lat);
+        snprintf(lon_json, sizeof(lon_json), "%.6f", s_live_lon);
+    }
+    if (s_last_live_telemetry_tick != 0) {
+        const uint32_t telemetry_age_ms = (uint32_t)((now_tick - s_last_live_telemetry_tick) * portTICK_PERIOD_MS);
+        snprintf(telemetry_age_json, sizeof(telemetry_age_json), "%lu", (unsigned long)telemetry_age_ms);
+    }
+
     snprintf(body, sizeof(body),
-             "{\"ok\":true,\"mode\":\"manual-gateway\",\"wifiConnected\":%s,\"manualReady\":%s,\"lastManualCommand\":\"%s\",\"manualCommandCount\":%lu,\"manualCommandAgeMs\":%lu,\"lastLoRaDownlink\":\"%s\",\"lastStmForward\":\"%s\",\"loraRxCount\":%lu,\"uartForwardCount\":%lu,\"gatewayState\":\"%s\",\"loraStatus\":\"%s\",\"uartStatus\":\"%s\"}",
+             "{\"ok\":true,\"mode\":\"manual-gateway\",\"wifiConnected\":%s,\"manualReady\":%s,\"lastManualCommand\":\"%s\",\"manualCommandCount\":%lu,\"manualCommandAgeMs\":%lu,\"lastLoRaDownlink\":\"%s\",\"lastStmForward\":\"%s\",\"loraRxCount\":%lu,\"uartForwardCount\":%lu,\"gatewayState\":\"%s\",\"loraStatus\":\"%s\",\"uartStatus\":\"%s\",\"robotTelemetry\":{\"state\":\"%s\",\"headingDeg\":%s,\"gpsSat\":%s,\"gpsHdop\":%s,\"proxLeft\":%s,\"proxRight\":%s,\"lat\":%s,\"lon\":%s,\"ageMs\":%s}}",
              s_wifi_connected ? "true" : "false",
              s_wifi_connected ? "true" : "false",
              s_last_manual_http_cmd,
@@ -590,7 +762,16 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
              s_last_uplink,
              (unsigned long)s_lora_rx_count,
              (unsigned long)s_uart_forward_count,
-             s_gateway_mode, s_lora_status, s_uart_status);
+             s_gateway_mode, s_lora_status, s_uart_status,
+             s_live_robot_state,
+             heading_json,
+             gps_sat_json,
+             gps_hdop_json,
+             prox_left_json,
+             prox_right_json,
+             lat_json,
+             lon_json,
+             telemetry_age_json);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
@@ -635,7 +816,7 @@ static esp_err_t command_post_handler(httpd_req_t *req) {
     update_preview_text(command, s_last_manual_http_cmd, sizeof(s_last_manual_http_cmd));
     set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "MANUAL");
     forward_command_to_stm32(command, "HTTP", true);
-    char response[160];
+    char response[384];
     snprintf(response, sizeof(response), "{\"ok\":true,\"forwarded\":true,\"cmd\":\"%s\",\"count\":%lu}", command, (unsigned long)s_manual_http_count);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, response);
@@ -685,12 +866,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 }
 
 static void wifi_setup(void) {
-    snprintf(s_wifi_cfg.ssid, sizeof(s_wifi_cfg.ssid), "%s", GW_STA_SSID);
-    snprintf(s_wifi_cfg.pass, sizeof(s_wifi_cfg.pass), "%s", GW_STA_PASS);
-    snprintf(s_wifi_cfg.ip, sizeof(s_wifi_cfg.ip), "%s", GW_STA_STATIC_IP);
-    snprintf(s_wifi_cfg.gw, sizeof(s_wifi_cfg.gw), "%s", GW_STA_GW);
-    snprintf(s_wifi_cfg.netmask, sizeof(s_wifi_cfg.netmask), "%s", GW_STA_NETMASK);
-    ESP_LOGI(TAG, "Using hardcoded gateway Wi-Fi cfg: ssid=%s", s_wifi_cfg.ssid);
+    // Prefer the last provisioned Wi-Fi settings so the gateway can be
+    // reconfigured from the base station without reflashing firmware.
+    wifi_runtime_cfg_t loaded = {0};
+    if (load_wifi_cfg_from_nvs(&loaded) && loaded.ssid[0] != '\0') {
+        s_wifi_cfg = loaded;
+        ESP_LOGI(TAG, "Loaded saved gateway Wi-Fi cfg from NVS: ssid=%s", s_wifi_cfg.ssid);
+    } else {
+        snprintf(s_wifi_cfg.ssid, sizeof(s_wifi_cfg.ssid), "%s", GW_STA_SSID);
+        snprintf(s_wifi_cfg.pass, sizeof(s_wifi_cfg.pass), "%s", GW_STA_PASS);
+        snprintf(s_wifi_cfg.ip, sizeof(s_wifi_cfg.ip), "%s", GW_STA_STATIC_IP);
+        snprintf(s_wifi_cfg.gw, sizeof(s_wifi_cfg.gw), "%s", GW_STA_GW);
+        snprintf(s_wifi_cfg.netmask, sizeof(s_wifi_cfg.netmask), "%s", GW_STA_NETMASK);
+        ESP_LOGI(TAG, "Using built-in gateway Wi-Fi cfg: ssid=%s", s_wifi_cfg.ssid);
+    }
 
     esp_err_t err = start_or_reconfigure_wifi_from_cfg(&s_wifi_cfg);
     if (err != ESP_OK) {
@@ -935,6 +1124,10 @@ static void uart_rx_task(void *arg) {
                         char *trimmed = trim_inplace(line);
                         if (trimmed[0] == '\0') { line_len = 0; line_chunked = false; last_byte_tick = 0; continue; }
                         update_preview_text(trimmed, s_last_uplink, sizeof(s_last_uplink));
+                        // Parse telemetry before filtering so even frames we
+                        // intentionally suppress from LoRa can still update the
+                        // gateway's local operator view.
+                        update_live_robot_telemetry(trimmed);
                         if (!should_drop_uart_uplink(trimmed) && !should_rate_limit_low_priority_uplink(trimmed)) {
                             if ((int)strlen(trimmed) > chunk_max) {
                                 size_t total = strlen(trimmed);
@@ -969,6 +1162,9 @@ static void uart_rx_task(void *arg) {
             if ((now - last_byte_tick) >= idle_flush_ticks) {
                 line[line_len] = '\0';
                 char *trimmed = trim_inplace(line);
+                if (trimmed[0] != '\0') {
+                    update_live_robot_telemetry(trimmed);
+                }
                 if (trimmed[0] != '\0' && !should_drop_uart_uplink(trimmed) && !should_rate_limit_low_priority_uplink(trimmed)) {
                     lora_send_text(trimmed);
                 }
