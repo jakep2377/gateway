@@ -32,26 +32,30 @@
 // flooding each other or losing the latest manual-control intent.
 
 // ---------------- LoRa settings ----------------
-#define LORA_FREQ_HZ       915000000
-#define LORA_TX_POWER_DBM  22
-#define LORA_TCXO_VOLT     3.3f
-#define LORA_USE_LDO       true
+#define LORA_FREQ_HZ       915000000   /* 915 MHz US ISM band */
+#define LORA_TX_POWER_DBM  22          /* Maximum output power for RA-01S/SX1262 */
+#define LORA_TCXO_VOLT     3.3f        /* TCXO reference voltage on the RA-01S module */
+#define LORA_USE_LDO       true        /* RA-01S uses LDO regulator internally */
 
-#define LORA_SF            7
-#define LORA_BW            4
-#define LORA_CR            1
-#define LORA_PREAMBLE      8
-#define LORA_PAYLOAD_LEN   0
-#define LORA_CRC_ON        true
+#define LORA_SF            7           /* Spreading factor (SF7 = fastest/shortest range) */
+#define LORA_BW            4           /* Bandwidth index 4 = 125 kHz */
+#define LORA_CR            1           /* Coding rate 4/5 */
+#define LORA_PREAMBLE      8           /* Preamble length in symbols */
+#define LORA_PAYLOAD_LEN   0           /* 0 = variable-length mode */
+#define LORA_CRC_ON        true        /* CRC enabled for over-the-air error detection */
 #define LORA_INVERT_IRQ    false
 
 // ---------------- Gateway Wi-Fi ----------------
-#define GW_STA_SSID        "GriffiniPhone"
+#define GW_STA_SSID        "GriffiniPhone"      /* Default SSID — overridden at runtime via LoRa config or NVS */
 #define GW_STA_PASS        "12345678"
-#define GW_STA_STATIC_IP   "172.20.10.2"
+#define GW_STA_STATIC_IP   "172.20.10.2"        /* Static IP on the operator's hotspot */
 #define GW_STA_GW          "172.20.10.1"
 #define GW_STA_NETMASK     "255.255.255.240"
+/* Prefix that identifies a Wi-Fi configuration payload arriving over LoRa.
+ * Full frame format: GWCFG:WIFI:<ssid>|<pass>|<ip>|<gw>|<mask> */
 #define GW_WIFI_CFG_PREFIX "GWCFG:WIFI:"
+/* NVS namespace/key names used to persist the runtime Wi-Fi configuration so
+ * it survives a firmware reset without needing to be re-sent over LoRa. */
 #define GW_WIFI_NVS_NAMESPACE "gw_wifi"
 #define GW_WIFI_NVS_KEY_SSID "ssid"
 #define GW_WIFI_NVS_KEY_PASS "pass"
@@ -60,49 +64,71 @@
 #define GW_WIFI_NVS_KEY_MASK "mask"
 
 // ---------------- UART settings ----------------
-#define GW_UART            UART_NUM_1
-#define GW_UART_BAUD       921600
+#define GW_UART            UART_NUM_1    /* UART peripheral used for STM32 link */
+#define GW_UART_BAUD       921600        /* High baud rate; must match the STM32 controller */
 #define GW_UART_TX_GPIO    6
 #define GW_UART_RX_GPIO    7
 
+/* RX ring buffer is deliberately large to tolerate bursts before the task runs. */
 #define UART_RX_BUF_SIZE   16384
 #define UART_TX_BUF_SIZE   8192
-#define UART_LINE_MAX      1024
+#define UART_LINE_MAX      1024         /* Maximum single-line payload buffered by the RX task */
 #define UART_EVENT_QUEUE_LEN 64
-#define LORA_MAX_PAYLOAD   255
-#define UART_STREAM_IDLE_FLUSH_MS        20
-#define UART_STREAM_SHORT_IDLE_FLUSH_MS  40
+#define LORA_MAX_PAYLOAD   255          /* SX1262 hardware limit for a single LoRa frame */
+
+/* Idle-flush thresholds: if the line buffer has not seen a '\n' after this
+ * many milliseconds of silence the partial data is forwarded anyway. */
+#define UART_STREAM_IDLE_FLUSH_MS        20   /* Normal (unchunked) flush timeout */
+#define UART_STREAM_SHORT_IDLE_FLUSH_MS  40   /* Shorter timeout used when a line was already chunked */
 #define UART_STREAM_MIN_FLUSH_BYTES      8
-#define UART_READ_TIMEOUT_MS             15
-#define UART_RX_MAX_BYTES_PER_PASS        128
-#define UART_RX_MAX_PASSES_PER_CYCLE      1
-#define UART_RX_DRAIN_PAUSE_MS            5
-#define UART_RX_LOOP_PAUSE_MS             10
+
+#define UART_READ_TIMEOUT_MS             15   /* How long the RX task blocks waiting for a UART event */
+#define UART_RX_MAX_BYTES_PER_PASS        128 /* Bytes drained from the HW FIFO per read call */
+#define UART_RX_MAX_PASSES_PER_CYCLE      1   /* Read passes per task wake-up (limits latency spike) */
+#define UART_RX_DRAIN_PAUSE_MS            5   /* Small yield between read passes to let other tasks run */
+#define UART_RX_LOOP_PAUSE_MS             10  /* Yield at the bottom of the RX task main loop */
 #define UART_BINARY_DROP_MAX_BYTES       3
 #define UART_BINARY_HEX_MAX_BYTES        24
-#define LORA_STREAM_CHUNK_MAX            220
-#define LORA_STREAM_HEADER_RESERVE       24
-#define LORA_TX_RETRY_COUNT 5
+
+/* LoRa stream-chunking parameters: long UART lines are split into multiple
+ * LoRa frames with S:<seq>:M:/<E: framing so the base station can reassemble them. */
+#define LORA_STREAM_CHUNK_MAX            220  /* Max payload bytes per chunked LoRa frame */
+#define LORA_STREAM_HEADER_RESERVE       24   /* Bytes reserved for the S:<seq>:M:/E: header */
+
+#define LORA_TX_RETRY_COUNT 5            /* Attempts before declaring a LoRa uplink failure */
 #define LORA_TX_RETRY_DELAY_MS 25
-#define LORA_TX_QUEUE_LEN 128
-#define LORA_TX_QUEUE_WAIT_MS 3
+#define LORA_TX_QUEUE_LEN 128            /* Depth of the async LoRa TX queue */
+#define LORA_TX_QUEUE_WAIT_MS 3          /* How long lora_send_text() waits for a queue slot */
+
+/* FreeRTOS task stack sizes (bytes). */
 #define TASK_STACK_LORA_TX 6144
 #define TASK_STACK_LORA_RX 6144
-#define TASK_STACK_UART_RX 10240
+#define TASK_STACK_UART_RX 10240         /* Larger stack because of in-task line assembly and logging */
 #define TASK_STACK_DISPLAY 4096
 #define TASK_STACK_WIFI_HTTP 6144
+
+/* Core affinity: LoRa/display tasks run on core 1 to keep the Wi-Fi/UART
+ * tasks on core 0, reducing contention on the SPI bus. */
 #define GATEWAY_APP_CORE 1
 #define UART_RX_TASK_CORE tskNO_AFFINITY
-#define TASK_PRIO_LORA_TX 4
+
+/* Task priorities (higher number = higher priority). */
+#define TASK_PRIO_LORA_TX 4             /* Highest: LoRa TX must not be starved by telemetry floods */
 #define TASK_PRIO_LORA_RX 3
 #define TASK_PRIO_UART_RX 1
 #define TASK_PRIO_DISPLAY 1
 #define LORA_RX_POLL_DELAY_MS           5
+/* Activity timestamps older than READY_MS are downgraded to "QUIET"; older
+ * than WARN_MS are downgraded to "STALE" so the OLED alert page fires. */
 #define GATEWAY_ACTIVITY_READY_MS        8000
 #define GATEWAY_ACTIVITY_WARN_MS         90000
+/* Minimum milliseconds between consecutive low-priority uplink transmissions
+ * to avoid saturating the LoRa airtime with robot telemetry. */
 #define LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS 30
+/* After a manual downlink command is received, suppress low-priority uplinks
+ * for this window so the base station isn't flooded while it's steering. */
 #define MANUAL_DOWNLINK_GUARD_MS         140
-#define GATEWAY_MOTION_LOG_THROTTLE_MS   1000
+#define GATEWAY_MOTION_LOG_THROTTLE_MS   1000  /* Throttle serial logging of motion commands */
 
 static const char *TAG = "ROBOT_GW";
 static bool display_available = false;
@@ -197,6 +223,9 @@ static void set_status_text(char *target, size_t target_size, const char *value)
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static esp_err_t start_or_reconfigure_wifi_from_cfg(const wifi_runtime_cfg_t *cfg);
 
+/* Persist the current runtime Wi-Fi configuration to NVS so it survives
+ * a power cycle or firmware reset.  The gateway reads this back at startup
+ * and uses it instead of the compiled-in defaults if a valid SSID is found. */
 static esp_err_t save_wifi_cfg_to_nvs(const wifi_runtime_cfg_t *cfg) {
     if (!cfg || cfg->ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
 
@@ -215,6 +244,9 @@ static esp_err_t save_wifi_cfg_to_nvs(const wifi_runtime_cfg_t *cfg) {
     return err;
 }
 
+/* Load a previously saved Wi-Fi configuration from NVS.
+ * Returns true and fills *out on success; returns false if no configuration
+ * has been saved yet or if the stored SSID is empty. */
 static bool load_wifi_cfg_from_nvs(wifi_runtime_cfg_t *out) {
     if (!out) return false;
 
@@ -296,6 +328,9 @@ static esp_err_t apply_wifi_sta_config(const wifi_runtime_cfg_t *cfg, bool recon
     return ESP_OK;
 }
 
+/* Parse a LoRa Wi-Fi configuration payload into *out.
+ * Expected format: GWCFG:WIFI:<ssid>|<pass>[|<ip>|<gw>|<mask>]
+ * The IP/gateway/mask fields are optional; if absent DHCP will be used. */
 static bool parse_wifi_cfg_message(const char *payload, wifi_runtime_cfg_t *out) {
     if (!payload || !out) return false;
     if (strncmp(payload, GW_WIFI_CFG_PREFIX, strlen(GW_WIFI_CFG_PREFIX)) != 0) return false;
@@ -326,6 +361,8 @@ static bool parse_wifi_cfg_message(const char *payload, wifi_runtime_cfg_t *out)
     return true;
 }
 
+/* One-time Wi-Fi stack and driver initialisation.  Idempotent: safe to call
+ * multiple times; subsequent calls are no-ops. */
 static esp_err_t wifi_stack_init_once(void) {
     if (s_wifi_stack_ready) return ESP_OK;
 
@@ -369,6 +406,14 @@ static esp_err_t start_or_reconfigure_wifi_from_cfg(const wifi_runtime_cfg_t *cf
     return ESP_OK;
 }
 
+/* Dispatch a gateway-addressed LoRa control frame.
+ *
+ * Currently handles only GWCFG:WIFI: messages.  Frames that carry only a
+ * status/ack suffix (no '|' separator) are silently consumed to prevent
+ * our own ACK echoes from triggering a reconfiguration loop.
+ *
+ * Returns true if the frame was consumed (even if processing failed), so the
+ * caller knows not to forward it to the STM32. */
 static bool handle_gateway_control_command(const char *cmd) {
     if (!cmd) return false;
     if (strncmp(cmd, GW_WIFI_CFG_PREFIX, strlen(GW_WIFI_CFG_PREFIX)) != 0) return false;
@@ -585,12 +630,18 @@ static bool matches_any_token(const char *value, const char *const *tokens, size
     return false;
 }
 
+/* High-priority uplinks (ACKs, faults, ESTOPs) must never be suppressed,
+ * regardless of rate-limiting or manual-mode guards. */
 static bool is_high_priority_manual_uplink(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
     if (strncmp(payload, "ACK:", 4) == 0) return true;
     return strncmp(payload, "F:", 2) == 0 || strncmp(payload, "FAULT", 5) == 0 || strstr(payload, "ESTOP") != NULL;
 }
 
+/* Returns true for LoRa downlinks that originate from a human operator
+ * (joystick, drive, named commands).  Used to:
+ *   1. Record s_last_manual_downlink_tick for the uplink guard window.
+ *   2. Decide whether to log the command at INFO level. */
 static bool is_manual_downlink_command(const char *payload) {
     static const char *const manual_tokens[] = {
         "MANUAL", "PAUSE", "AUTO", "RESET",
@@ -613,11 +664,16 @@ static bool is_manual_downlink_command(const char *payload) {
         sizeof(manual_tokens) / sizeof(manual_tokens[0]));
 }
 
+/* Placeholder suppression hook for future manual-mode uplink filtering.
+ * Currently a no-op; kept so the call-site logic doesn't need to change
+ * if mode-based suppression is added later. */
 static bool should_suppress_uplink_in_manual_mode(const char *payload) {
     (void)payload;
     return false;
 }
 
+/* Identify repetitive console/health-check lines that would flood the LoRa
+ * channel without conveying meaningful new information to the base station. */
 static bool is_noisy_console_uplink(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
     return strstr(payload, "[HEALTH] GPS: TIMEOUT") != NULL ||
@@ -626,6 +682,8 @@ static bool is_noisy_console_uplink(const char *payload) {
            strstr(payload, "[CONSOLE] USART2 RX recovered") != NULL;
 }
 
+/* Returns true when an uplink frame should be silently dropped rather than
+ * forwarded over LoRa.  High-priority frames are always passed through. */
 static bool should_drop_uart_uplink(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
     if (is_high_priority_manual_uplink(payload)) return false;
@@ -633,6 +691,13 @@ static bool should_drop_uart_uplink(const char *payload) {
     return should_suppress_uplink_in_manual_mode(payload);
 }
 
+/* Rate-limit low-priority (non-ACK, non-fault) uplinks to avoid saturating
+ * LoRa airtime.  Two independent guards apply:
+ *   1. MANUAL_DOWNLINK_GUARD_MS: silence uplinks briefly after a manual
+ *      command so the base station doesn't receive telemetry mid-command.
+ *   2. LOW_PRIORITY_UPLINK_MIN_INTERVAL_MS: global minimum spacing between
+ *      consecutive low-priority transmissions.
+ * Returns true (suppress) when either guard is active. */
 static bool should_rate_limit_low_priority_uplink(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
     if (is_high_priority_manual_uplink(payload)) return false;
@@ -643,6 +708,8 @@ static bool should_rate_limit_low_priority_uplink(const char *payload) {
     return false;
 }
 
+/* Returns true for frames that the gateway generates itself (GWRX acks,
+ * GWCFG status replies).  These must not be re-forwarded to the STM32. */
 static bool is_gateway_ack_or_status_frame(const char *payload) {
     if (!payload || payload[0] == '\0') return false;
     return strncmp(payload, "GWRX:", 5) == 0 ||
@@ -682,6 +749,12 @@ static void refresh_gateway_display_states(void) {
     else set_status_text(s_gateway_mode, sizeof(s_gateway_mode), "WIFI");
 }
 
+/* Parse a LoRa stream frame with the format:  S:<seq>:<M|E>:<payload>
+ *   S:   — stream marker
+ *   seq  — monotonically increasing sequence number (allows gap detection)
+ *   M:   — middle chunk (more to follow); E: — end chunk (last in sequence)
+ *   payload — the actual data fragment
+ * Non-stream frames are returned with is_stream=false and payload=text. */
 static stream_frame_t parse_stream_frame(char *text) {
     stream_frame_t out = { .is_stream = false, .has_end = true, .seq = 0, .payload = text };
     if (!text || strncmp(text, "S:", 2) != 0) return out;
@@ -930,6 +1003,10 @@ static void uart_setup(void) {
     ESP_LOGI(TAG, "UART ready: UART%d TX=%d RX=%d @ %d", (int)GW_UART, GW_UART_TX_GPIO, GW_UART_RX_GPIO, GW_UART_BAUD);
 }
 
+/* Blocking LoRa transmit with retry.  Holds lora_tx_lock for the duration so
+ * the RX path cannot attempt a LoRaReceive() concurrently (the SX1262 is
+ * half-duplex and shares the SPI bus).  Callers that can tolerate dropping a
+ * frame under load should use lora_send_text() instead. */
 static void lora_send_text_blocking(const char *text) {
     if (!text) return;
     size_t n = strnlen(text, UART_LINE_MAX - 1);
@@ -957,6 +1034,8 @@ static void lora_send_text_blocking(const char *text) {
     }
 }
 
+/* Thin wrapper: acquires lora_tx_lock around LoRaReceive() so the TX and RX
+ * paths are mutually exclusive on the shared SPI bus. */
 static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size) {
     if (!rx || rx_size == 0) return 0;
     xSemaphoreTake(lora_tx_lock, portMAX_DELAY);
@@ -965,6 +1044,10 @@ static uint8_t lora_receive_locked(uint8_t *rx, size_t rx_size) {
     return count;
 }
 
+/* Non-blocking LoRa transmit: enqueue text into the async TX queue and
+ * return immediately.  If the queue is full the frame is dropped and the drop
+ * counter is incremented; a warning is logged every 25th drop to bound log
+ * volume during sustained overload. */
 static void lora_send_text(const char *text) {
     if (!text) return;
     if (!s_lora_tx_queue) { lora_send_text_blocking(text); return; }
@@ -976,6 +1059,9 @@ static void lora_send_text(const char *text) {
     }
 }
 
+/* LoRa TX task: serialises all outbound LoRa transmissions through a
+ * queue so callers never block waiting for airtime.  Runs at the highest
+ * gateway priority to minimise transmit latency once the radio is free. */
 static void lora_tx_task(void *arg) {
     (void)arg;
     lora_tx_item_t item;
@@ -986,6 +1072,14 @@ static void lora_tx_task(void *arg) {
     }
 }
 
+/* LoRa RX task: polls the SX1262 for incoming frames, dispatches gateway
+ * control commands, reassembles multi-chunk stream frames, forwards the
+ * result to the STM32 over UART, and echoes a GWRX: acknowledgement back
+ * to the base station so it knows the gateway is alive and received the frame.
+ *
+ * Stream reassembly state (rx_stream_buf / rx_stream_len / rx_seq_*) is
+ * module-level so it survives across multiple task iterations.  A sequence-
+ * number gap resets the buffer rather than forwarding a corrupt partial line. */
 static void lora_rx_task(void *arg) {
     (void)arg;
     uint8_t rx[255];
@@ -1003,14 +1097,20 @@ static void lora_rx_task(void *arg) {
             update_preview_text(cmd, s_last_downlink, sizeof(s_last_downlink));
             s_lora_rx_count++;
             note_lora_activity();
+            /* Silently consume gateway-generated ack/status echoes to avoid
+             * forwarding our own reflections to the STM32. */
             if (is_gateway_ack_or_status_frame(cmd)) {
                 vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
                 continue;
             }
+            /* Throttle serial log output for high-frequency motion commands
+             * to avoid flooding the debug console. */
             bool motion = is_manual_downlink_command(cmd);
             TickType_t now = xTaskGetTickCount();
             bool should_log_motion = !motion || last_motion_log_tick == 0 || (now - last_motion_log_tick) >= manual_log_interval_ticks;
             if (should_log_motion && motion) last_motion_log_tick = now;
+            /* Handle gateway-addressed frames (e.g. GWCFG:WIFI:) before
+             * attempting to forward anything to the STM32. */
             if (handle_gateway_control_command(cmd)) {
                 vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS));
                 continue;
@@ -1018,9 +1118,13 @@ static void lora_rx_task(void *arg) {
             stream_frame_t frame = parse_stream_frame(cmd);
             const char *uart_payload = frame.payload ? frame.payload : "";
             if (frame.is_stream) {
+                /* Sequence-number gap: discard the partial buffer and restart
+                 * from the new sequence to avoid forwarding a corrupt line. */
                 if (!rx_seq_init) { rx_seq_expected = frame.seq; rx_seq_init = true; }
                 else if (frame.seq != rx_seq_expected) { rx_stream_len = 0; rx_seq_expected = frame.seq; }
                 size_t payload_len = strlen(uart_payload);
+                /* Strip a trailing newline from the chunk to avoid double-newlines
+                 * when the reassembled line is written to UART. */
                 if (payload_len > 0 && uart_payload[payload_len - 1] == '\n') payload_len--;
                 int remain = (int)sizeof(rx_stream_buf) - 1 - rx_stream_len;
                 if (remain > 0 && payload_len > 0) {
@@ -1030,13 +1134,16 @@ static void lora_rx_task(void *arg) {
                     rx_stream_buf[rx_stream_len] = '\0';
                 }
                 rx_seq_expected = frame.seq + 1;
+                /* M: (middle) chunk — accumulate and wait for the E: (end) chunk. */
                 if (!frame.has_end) { vTaskDelay(pdMS_TO_TICKS(LORA_RX_POLL_DELAY_MS)); continue; }
+                /* E: (end) chunk — flush the reassembled line to the STM32. */
                 forward_command_to_stm32(rx_stream_buf, "LoRa", should_log_motion);
                 rx_stream_len = 0;
                 rx_stream_buf[0] = '\0';
             } else {
                 forward_command_to_stm32(uart_payload, "LoRa", should_log_motion);
             }
+            /* Acknowledge receipt so the base station can confirm delivery. */
             char ack[80];
             snprintf(ack, sizeof(ack), "GWRX:%.69s", cmd);
             lora_send_text(ack);
@@ -1045,6 +1152,9 @@ static void lora_rx_task(void *arg) {
     }
 }
 
+/* Display task: refreshes the OLED panel every 700 ms.
+ * If the display was absent at boot (or failed later) the task retries
+ * init every 5 seconds in case the hardware becomes available after power-up. */
 static void gateway_display_task(void *arg) {
     (void)arg;
     TickType_t next_display_init_retry = 0;
@@ -1076,12 +1186,27 @@ static void gateway_display_task(void *arg) {
     }
 }
 
+/* UART RX task: reads the STM32 UART byte-by-byte, assembles complete lines,
+ * and forwards them over LoRa after applying suppression and rate-limiting.
+ *
+ * Line assembly strategy:
+ *   - Characters are buffered until '\n' is received or the idle-flush timer
+ *     fires (handles robots that omit the trailing newline or send slowly).
+ *   - Lines longer than chunk_max bytes are split into S:<seq>:M:/E: stream
+ *     frames so the base station can reassemble them transparently.
+ *   - Control characters below 0x09 and DEL (0x7F) are discarded in-line
+ *     to guard against binary garbage from the STM32 at startup.
+ *
+ * Overflow handling: FIFO overflow or ring-buffer-full events flush the UART
+ * input and reset the event queue to prevent stale data from being forwarded.
+ */
 static void uart_rx_task(void *arg) {
     (void)arg;
     char line[UART_LINE_MAX];
     int line_len = 0;
-    bool line_chunked = false;
-    uint32_t stream_seq = 0;
+    bool line_chunked = false;   /* true when the current line has already overflowed chunk_max */
+    uint32_t stream_seq = 0;     /* Monotonically increasing sequence number for chunked frames */
+    /* Effective maximum payload per LoRa frame after reserving header space. */
     const int stream_payload_max = (LORA_MAX_PAYLOAD > LORA_STREAM_HEADER_RESERVE) ? (LORA_MAX_PAYLOAD - LORA_STREAM_HEADER_RESERVE) : LORA_MAX_PAYLOAD;
     const int chunk_max = (stream_payload_max < LORA_STREAM_CHUNK_MAX) ? stream_payload_max : LORA_STREAM_CHUNK_MAX;
     TickType_t last_byte_tick = 0;
@@ -1094,6 +1219,8 @@ static void uart_rx_task(void *arg) {
                     case UART_DATA: saw_uart_data = true; break;
                     case UART_FIFO_OVF:
                     case UART_BUFFER_FULL:
+                        /* Flush and reset on overflow to avoid forwarding a
+                         * corrupt partial line assembled from two bursts. */
                         s_uart_overflow_count++;
                         ESP_LOGW(TAG, "UART overflow (type=%d count=%lu), flushing input", (int)event.type, (unsigned long)s_uart_overflow_count);
                         uart_flush_input(GW_UART);
@@ -1116,6 +1243,7 @@ static void uart_rx_task(void *arg) {
                 note_uart_activity();
                 for (int i = 0; i < read_count; i++) {
                     char c = line[i];
+                    /* Drop control characters that indicate binary/garbage data. */
                     if ((unsigned char)c < 0x09 || (unsigned char)c == 0x7F) continue;
                     if (c == '\r') continue;
                     if (c == '\n') {
@@ -1130,6 +1258,9 @@ static void uart_rx_task(void *arg) {
                         update_live_robot_telemetry(trimmed);
                         if (!should_drop_uart_uplink(trimmed) && !should_rate_limit_low_priority_uplink(trimmed)) {
                             if ((int)strlen(trimmed) > chunk_max) {
+                                /* Line exceeds a single LoRa frame: split into
+                                 * S:<seq>:M:… (middle) and S:<seq>:E:… (end)
+                                 * chunks for reassembly at the base station. */
                                 size_t total = strlen(trimmed);
                                 size_t offset = 0;
                                 while (offset < total) {
@@ -1150,12 +1281,16 @@ static void uart_rx_task(void *arg) {
                         last_byte_tick = 0;
                     } else {
                         if (line_len < UART_LINE_MAX - 1) { line[line_len++] = c; last_byte_tick = xTaskGetTickCount(); }
-                        else { line_chunked = true; }
+                        else { line_chunked = true; }   /* Mark as chunked; the idle flush will still send it */
                     }
                 }
                 vTaskDelay(pdMS_TO_TICKS(UART_RX_DRAIN_PAUSE_MS));
             }
         }
+        /* Idle-flush: if the line buffer has content but no '\n' has arrived
+         * within the idle timeout, forward the partial line anyway.  Uses a
+         * shorter timeout when the line was already chunked (i.e. already
+         * exceeded one LoRa frame) to reduce end-to-end latency. */
         if (line_len > 0 && last_byte_tick != 0) {
             TickType_t now = xTaskGetTickCount();
             const TickType_t idle_flush_ticks = line_chunked ? pdMS_TO_TICKS(UART_STREAM_SHORT_IDLE_FLUSH_MS) : pdMS_TO_TICKS(UART_STREAM_IDLE_FLUSH_MS);
@@ -1177,7 +1312,19 @@ static void uart_rx_task(void *arg) {
     }
 }
 
+/* Entry point: initialise all peripherals and launch the gateway tasks.
+ *
+ * Startup order matters:
+ *   1. UART first so the STM32 link is ready before any LoRa frames arrive.
+ *   2. LoRa so the radio is listening before Wi-Fi brings up the HTTP server.
+ *   3. Wi-Fi (non-blocking; connects asynchronously via the event handler).
+ *   4. Display (optional; gateway continues without it if the I2C probe fails).
+ *
+ * The display task is only spawned when the display is confirmed present at
+ * boot; it then handles its own re-init retries internally.
+ */
 void app_main(void) {
+    /* Mutex serialises concurrent TX/RX access to the shared SX1262 SPI bus. */
     lora_tx_lock = xSemaphoreCreateMutex();
     s_lora_tx_queue = xQueueCreate(LORA_TX_QUEUE_LEN, sizeof(lora_tx_item_t));
     if (!lora_tx_lock || !s_lora_tx_queue) {

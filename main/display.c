@@ -1,3 +1,14 @@
+/* display.c — SSD1306 OLED rendering for the robot gateway.
+ *
+ * Drives a 128×64 SSD1306 panel over I2C using the esp-idf-ssd1306 component.
+ * The panel is treated as an 8-row × 16-character text grid (8×8 px font).
+ *
+ * All rendering is done through display_show_gateway_status(), which is meant
+ * to be called from a low-priority task at ~700 ms intervals.  The function
+ * manages its own dirty-line cache, page switching, and long-text scrolling
+ * without requiring any caller-side state.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -13,18 +24,26 @@
 #include "esp_log.h"
 #include "esp_idf_version.h"
 
-#define OLED_SDA 17
-#define OLED_SCL 18
-#define OLED_RST 21
-#define OLED_VEXT 36
+/* --- Hardware pin assignments (Heltec WiFi LoRa 32 V3 layout) --- */
+#define OLED_SDA 17          /* I2C data line to SSD1306 */
+#define OLED_SCL 18          /* I2C clock line to SSD1306 */
+#define OLED_RST 21          /* Active-low reset for SSD1306 */
+#define OLED_VEXT 36         /* GPIO that gates the 3.3 V OLED supply rail */
 #define OLED_I2C_PORT I2C_NUM_0
-#define OLED_TEXT_LINE_LEN 16
-#define OLED_PAGE_SWITCH_MS 7000
-#define OLED_SCROLL_STEP_MS 350
+
+/* --- Display geometry / timing constants --- */
+#define OLED_TEXT_LINE_LEN 16        /* Visible characters per row (128 px / 8 px font) */
+#define OLED_PAGE_SWITCH_MS 7000     /* How long each display page stays visible (ms) */
+#define OLED_SCROLL_STEP_MS 350      /* Horizontal scroll advances one character per step (ms) */
 
 static SSD1306_t dev;
 static const char *TAG = "GW_DISPLAY";
 
+/* Write one 16-character row to the panel.
+ * If invert is false the function compares the new content against the
+ * per-row cache and skips the I2C write when nothing has changed, reducing
+ * bus traffic on a ~700 ms refresh loop.  Inverted (alert) rows are always
+ * redrawn because the inversion flag is not stored in the cache. */
 static void write_line_ex(int row, const char *text, char *cache, size_t cache_size, bool invert) {
     char buffer[OLED_TEXT_LINE_LEN + 1];
     snprintf(buffer, sizeof(buffer), "%-16.16s", text ? text : "");
@@ -35,10 +54,14 @@ static void write_line_ex(int row, const char *text, char *cache, size_t cache_s
     snprintf(cache, cache_size, "%s", buffer);
 }
 
+/* Convenience wrapper: non-inverted write with dirty-line caching. */
 static void write_line(int row, const char *text, char *cache, size_t cache_size) {
     write_line_ex(row, text, cache, cache_size, false);
 }
 
+/* Strip well-known gateway label prefixes (CMD:, ACK:, GWRX:, GWTX:) so the
+ * OLED shows only the payload value rather than the protocol tag.  Returns a
+ * pointer into the original string — no allocation. */
 static const char *display_value_start(const char *input) {
     static const char empty[] = "none";
 
@@ -61,6 +84,9 @@ static const char *display_value_start(const char *input) {
     return *start ? start : empty;
 }
 
+/* Extract the first whitespace/comma-delimited token after stripping any
+ * protocol prefix.  Used for status fields where only the leading word is
+ * meaningful (e.g. "MANUAL,1234" → "MANUAL"). */
 static void compact_token_label(const char *input, char *out, size_t out_size) {
     if (!out || out_size == 0) {
         return;
@@ -80,6 +106,10 @@ static void compact_token_label(const char *input, char *out, size_t out_size) {
     }
 }
 
+/* Return a fixed-width window into a long string, advancing by 'offset'
+ * characters.  When the text fits within out_size-1 characters it is copied
+ * verbatim; otherwise the window wraps around so long payloads scroll across
+ * the 16-character display row on successive render calls. */
 static void copy_windowed_text(const char *input, char *out, size_t out_size, size_t offset) {
     if (!out || out_size == 0) {
         return;
@@ -100,6 +130,16 @@ static void copy_windowed_text(const char *input, char *out, size_t out_size, si
     snprintf(out, out_size, "%.*s", (int)width, start + begin);
 }
 
+/* Normalise a raw status string to a short, fixed-vocabulary label that fits
+ * the 16-character grid.  Recognised semantic groups:
+ *   connected/online/ready/ok  → "OK"
+ *   bridge/link/forward        → "LINK"
+ *   setup/config/ap            → "SETUP"
+ *   degraded/stale/warn        → "WARN"
+ *   none/off/disconn           → "OFF"
+ *   idle                       → "IDLE"
+ *   anything else              → upper-cased token (or "--" if empty)
+ */
 static void compact_state_label(const char *input, char *out, size_t out_size) {
     char token[16];
     compact_token_label(input, token, sizeof(token));
@@ -135,10 +175,15 @@ static void compact_state_label(const char *input, char *out, size_t out_size) {
     }
 }
 
+/* Returns true when the compact label warrants showing the alert page.
+ * "WARN" means a degraded link; "OFF" means a completely absent link. */
 static bool state_needs_alert(const char *label) {
     return label && (strcmp(label, "WARN") == 0 || strcmp(label, "OFF") == 0);
 }
 
+/* Probe both common SSD1306 I2C addresses (0x3C and 0x3D) and store the
+ * responding address in dev._address.  Uses the ESP-IDF v5 master-probe API
+ * when available, falling back to a manual start/stop sequence on v4. */
 static bool oled_probe(void) {
     const uint8_t addresses[] = {0x3C, 0x3D};
 
@@ -177,6 +222,8 @@ static bool oled_probe(void) {
 }
 
 bool display_init(void) {
+    /* Enable VEXT to power the OLED panel; the rail needs ~100 ms to stabilise
+     * before the reset sequence can begin. */
     gpio_config_t vext_conf = {
         .pin_bit_mask = 1ULL << OLED_VEXT,
         .mode = GPIO_MODE_OUTPUT,
@@ -188,6 +235,8 @@ bool display_init(void) {
     ESP_ERROR_CHECK(gpio_set_level(OLED_VEXT, 0));
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    /* Hardware reset: pull RST low for 20 ms, then release.  The SSD1306
+     * datasheet requires at least 3 µs; 20 ms gives plenty of margin. */
     gpio_config_t rst_conf = {
         .pin_bit_mask = 1ULL << OLED_RST,
         .mode = GPIO_MODE_OUTPUT,
@@ -210,6 +259,7 @@ bool display_init(void) {
 
     ssd1306_init(&dev, 128, 64);
     ssd1306_clear_screen(&dev, false);
+    /* Brief splash so the operator can confirm the display is working. */
     ssd1306_display_text(&dev, 2, "NAVIGATOR GW", 12, false);
     ssd1306_display_text(&dev, 4, "PLEASE WAIT", 11, false);
     vTaskDelay(pdMS_TO_TICKS(220));
@@ -230,6 +280,8 @@ void display_show_gateway_status(const char *mode,
                                  uint32_t uart_forward_count,
                                  uint32_t tx_drop_count,
                                  uint32_t uart_overflow_count) {
+    /* Per-row dirty cache; cleared whenever the active page changes so that a
+     * full redraw is forced after the page-transition screen clear. */
     static char cache[8][OLED_TEXT_LINE_LEN + 1] = {{0}};
     static int last_page = -1;
     char line[OLED_TEXT_LINE_LEN + 1];
@@ -241,8 +293,12 @@ void display_show_gateway_status(const char *mode,
     char downlink_label[14];
     char uplink_label[14];
     TickType_t now = xTaskGetTickCount();
+    /* scroll_step increments once per OLED_SCROLL_STEP_MS; passed to
+     * copy_windowed_text() as the horizontal offset so long strings pan
+     * automatically across the 16-character row. */
     size_t scroll_step = (size_t)(now / pdMS_TO_TICKS(OLED_SCROLL_STEP_MS));
 
+    /* Normalise all raw status strings to short display labels. */
     compact_state_label(mode, mode_label, sizeof(mode_label));
     compact_state_label(lora_status, lora_label, sizeof(lora_label));
     compact_state_label(cmd_status, cmd_label, sizeof(cmd_label));
@@ -250,6 +306,9 @@ void display_show_gateway_status(const char *mode,
     compact_token_label(last_downlink, downlink_label, sizeof(downlink_label));
     compact_token_label(last_uplink, uplink_label, sizeof(uplink_label));
 
+    /* Determine how many pages to cycle through.  The alert page (page 2) is
+     * added only when a fault condition is present so normal operation stays
+     * on a comfortable two-page rotation. */
     bool show_alert = state_needs_alert(lora_label)
         || state_needs_alert(uart_label)
         || tx_drop_count > 0
@@ -257,24 +316,31 @@ void display_show_gateway_status(const char *mode,
     int page_count = show_alert ? 3 : 2;
     int page = (int)((now / pdMS_TO_TICKS(OLED_PAGE_SWITCH_MS)) % page_count);
 
+    /* On a page transition: clear the panel and invalidate the dirty cache so
+     * every row is redrawn from scratch on the new page. */
     if (page != last_page) {
         memset(cache, 0, sizeof(cache));
         ssd1306_clear_screen(&dev, false);
         last_page = page;
     }
 
+    /* --- Page 0: high-level gateway status --- */
     if (page == 0) {
         write_line(0, "GW STATUS P1", cache[0], sizeof(cache[0]));
 
         snprintf(line, sizeof(line), "MODE:%-.10s", mode_label);
         write_line(1, line, cache[1], sizeof(cache[1]));
 
+        /* Pack LoRa and CMD labels side-by-side on one row. */
         snprintf(line, sizeof(line), "L:%-.4s C:%-.4s", lora_label, cmd_label);
         write_line(2, line, cache[2], sizeof(cache[2]));
 
         snprintf(line, sizeof(line), "UART:%-.8s", uart_label);
         write_line(3, line, cache[3], sizeof(cache[3]));
 
+        /* Rows 4–7: scrolling previews of the most recent downlink/uplink
+         * payloads.  The two streams use different scroll offsets (+5) so
+         * they don't appear to move in lockstep. */
         write_line(4, "BASE->ROBOT", cache[4], sizeof(cache[4]));
         copy_windowed_text(last_downlink, detail, sizeof(detail), scroll_step);
         write_line(5, detail, cache[5], sizeof(cache[5]));
@@ -282,9 +348,12 @@ void display_show_gateway_status(const char *mode,
         write_line(6, "ROBOT->BASE", cache[6], sizeof(cache[6]));
         copy_windowed_text(last_uplink, detail, sizeof(detail), scroll_step + 5);
         write_line(7, detail, cache[7], sizeof(cache[7]));
+
+    /* --- Page 1: numeric counters and full message previews --- */
     } else if (page == 1) {
         write_line(0, "GW DETAIL P2", cache[0], sizeof(cache[0]));
 
+        /* Counters are modulo 100 so they always fit the two-digit field. */
         snprintf(line, sizeof(line), "RX:%02lu TX:%02lu",
                  (unsigned long)(lora_rx_count % 100),
                  (unsigned long)(uart_forward_count % 100));
@@ -304,6 +373,8 @@ void display_show_gateway_status(const char *mode,
         write_line(6, detail, cache[6], sizeof(cache[6]));
         snprintf(line, sizeof(line), "M:%.4s C:%.4s", mode_label, cmd_label);
         write_line(7, line, cache[7], sizeof(cache[7]));
+
+    /* --- Page 2: alert page (all rows inverted for high visual contrast) --- */
     } else {
         write_line_ex(0, "!!! GW ALERT !", cache[0], sizeof(cache[0]), true);
 
